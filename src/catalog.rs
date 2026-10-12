@@ -177,10 +177,26 @@ pub struct AudioConfig {
     pub bitrate: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub jitter: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "alternate_group_unset", deserialize_with = "deserialize_alternate_group", default)]
     pub alternate_group: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "label_unset", deserialize_with = "deserialize_label", default)]
     pub label: Option<String>,
+}
+
+fn alternate_group_unset(value: &Option<u32>) -> bool {
+    matches!(value, None | Some(0))
+}
+
+fn label_unset(value: &Option<String>) -> bool {
+    value.as_deref().unwrap_or_default().is_empty()
+}
+
+fn deserialize_alternate_group<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<u32>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(|value| value.filter(|group| *group != 0))
+}
+
+fn deserialize_label<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|value| value.filter(|label| !label.is_empty()))
 }
 
 /// Explicit audio metadata keyed by output track id (after remapping).

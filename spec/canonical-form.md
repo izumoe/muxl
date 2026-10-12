@@ -80,6 +80,9 @@ Audio rendition configs MAY include `alternateGroup` (unsigned 32-bit integer)
 and `label` (UTF-8 string). The JSON and DRISL keys are exactly `alternateGroup`
 and `label`. Unset fields MUST be omitted, not encoded as null, zero or an empty
 string; existing unlabeled catalogs, segments, init bytes and CIDs are unchanged.
+Zero groups and empty labels are normalized to unset when decoding catalogs
+and omitted when encoding, even if a caller supplies explicit zero/empty values.
+An empty label never produces a `trak/udta/name` box.
 
 Tracks with the same nonzero `alternateGroup` carry alternative encodings of
 the same content (e.g. AAC and Opus for one mix). Different groups are independent

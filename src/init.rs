@@ -586,7 +586,7 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
         },
         senc: None,
         tref: None,
-        udta: config.label.as_ref().map(|label| mp4_atom::Udta {
+        udta: config.label.as_ref().filter(|label| !label.is_empty()).map(|label| mp4_atom::Udta {
             name: Some(mp4_atom::TrackName { value: label.as_bytes().to_vec() }),
             ..Default::default()
         }),

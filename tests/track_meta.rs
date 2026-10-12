@@ -1,7 +1,6 @@
 //! Audio metadata is opt-in on source reads and authoritative in catalogs.
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::process::Command;
 
 use muxl::catalog::{Catalog, TrackMeta, TrackOptions};
 
@@ -141,38 +140,14 @@ fn explicit_metadata_reaches_every_reader_init_and_segment() {
 
 #[test]
 fn ffmpeg_source_metadata_is_opt_in_and_roundtrips_through_wrap() {
-    let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("labeled.mp4");
-    let result = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=880:sample_rate=48000",
-            "-map",
-            "0:a",
-            "-map",
-            "1:a",
-            "-t",
-            "2",
-            "-c:a",
-            "aac",
-            "-metadata:s:a:1",
-            "title=Music",
-            "-movflags",
-            "+frag_keyframe+empty_moov",
-        ])
-        .arg(&input)
-        .status()
-        .expect("ffmpeg must be installed for this test");
-    assert!(result.success());
-    let bytes = std::fs::read(input).unwrap();
+    // Generated once by ffmpeg with two AAC sine tracks and
+    // -metadata:s:a:1 title=Music -movflags +frag_keyframe+empty_moov.
+    // Keep this alongside the other samples so tests need no ffmpeg binary.
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/samples/fixtures/aac-two-track-labeled-frag.mp4"
+    ))
+    .unwrap();
     let plain = muxl::catalog::from_input(&bytes).unwrap();
     assert!(
         plain
@@ -316,4 +291,55 @@ fn ignored_source_metadata_does_not_validate_utf8() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn zero_and_empty_metadata_are_unset_on_every_catalog_boundary() {
+    use muxl::catalog::AudioConfig;
+    let baseline = muxl::catalog::from_input(&fixture()).unwrap();
+    let mut explicit = baseline.clone();
+    for audio in explicit.audio_configs_mut() {
+        audio.alternate_group = Some(0);
+        audio.label = Some(String::new());
+    }
+    assert_eq!(
+        muxl::catalog::to_drisl(&explicit).unwrap(),
+        muxl::catalog::to_drisl(&baseline).unwrap()
+    );
+    assert_eq!(
+        muxl::catalog::to_hang_json(&explicit).unwrap(),
+        muxl::catalog::to_hang_json(&baseline).unwrap()
+    );
+    let init = muxl::init::build_init_segment(&explicit).unwrap();
+    assert_eq!(init, muxl::init::build_init_segment(&baseline).unwrap());
+    let moov = muxl::init::read_moov(&mut Cursor::new(init)).unwrap();
+    assert!(
+        moov.trak
+            .iter()
+            .all(|t| t.udta.is_none() && t.tkhd.alternate_group == 0)
+    );
+
+    // Produce explicit zero/empty wire fields without AudioConfig's omission
+    // rules, exercising JSON and CBOR inputs from external callers.
+    #[derive(serde::Serialize)]
+    struct ExplicitAudio<'a> {
+        #[serde(flatten)]
+        config: &'a AudioConfig,
+        #[serde(rename = "alternateGroup")]
+        alternate_group: u32,
+        label: &'a str,
+    }
+    let audio = baseline.audio_configs().next().unwrap();
+    let wire = ExplicitAudio {
+        config: audio,
+        alternate_group: 0,
+        label: "",
+    };
+    let json = serde_json::to_string(&wire).unwrap();
+    let from_json: AudioConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(&from_json, audio);
+    let mut cbor = Vec::new();
+    dasl::drisl::to_writer(&mut cbor, &wire).unwrap();
+    let from_cbor: AudioConfig = dasl::drisl::from_slice(&cbor).unwrap();
+    assert_eq!(&from_cbor, audio);
 }
