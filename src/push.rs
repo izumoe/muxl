@@ -67,6 +67,8 @@ struct StreamingState {
     moov: Moov,
     catalog: Catalog,
     video_track_ids: HashSet<u32>,
+    /// The source (first) video track; only its keyframes open segments.
+    source_video_track: Option<u32>,
     /// Per-track media timescale, used to compute segment duration_us.
     track_timescales: BTreeMap<u32, u32>,
     track_state: HashMap<u32, fragment::TrackProgress>,
@@ -169,6 +171,7 @@ impl Segmenter {
                         self.state = State::Streaming(StreamingState {
                             moov,
                             catalog,
+                            source_video_track: video_track_ids.iter().min().copied(),
                             video_track_ids,
                             track_timescales,
                             track_state: HashMap::new(),
@@ -220,14 +223,14 @@ impl Segmenter {
                                 },
                             )?;
 
-                            // Accumulate into per-track buffers, splitting at video keyframes
+                            // Accumulate into per-track buffers, splitting at source video keyframes
                             for frame in frames {
                                 let is_video_keyframe =
-                                    ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
+                                    Some(frame.track_id) == ss.source_video_track && frame.is_sync;
 
-                                // New segment at a video keyframe (after the
-                                // first), or a 1s span for audio-only streams.
-                                let boundary = if ss.video_track_ids.is_empty() {
+                                // New segment at a source video keyframe (after
+                                // the first), or a 1s span for audio-only streams.
+                                let boundary = if ss.source_video_track.is_none() {
                                     audio_only_boundary(&ss.track_durations, &ss.track_timescales)
                                 } else {
                                     is_video_keyframe && ss.seen_first_keyframe
@@ -507,5 +510,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(push_total, pull_total, "total segment bytes should match");
+    }
+
+    #[test]
+    fn test_push_multi_video_matches_pull() {
+        // Two video tracks: push must cut only at the source track's
+        // keyframes, yielding the same two all-track GOPs as pull.
+        let data = read_fixture("av1-h264-opus-frag.mp4");
+
+        let mut segmenter = Segmenter::new();
+        let mut events = segmenter.feed(&data).unwrap();
+        events.extend(segmenter.flush().unwrap());
+        let gops: Vec<&GopSegment> = events
+            .iter()
+            .filter_map(|e| match e {
+                SegmenterEvent::Segment(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+
+        let mut pull_gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            pull_gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(gops.len(), 2);
+        assert_eq!(gops.len(), pull_gops.len());
+        for (push_gop, pull_gop) in gops.iter().zip(pull_gops.iter()) {
+            assert_eq!(push_gop.tracks.len(), 3, "GOP {} should carry all tracks", push_gop.number);
+            assert_eq!(push_gop.tracks, pull_gop.tracks, "GOP {} mismatch", push_gop.number);
+        }
     }
 }

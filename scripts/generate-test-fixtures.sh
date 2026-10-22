@@ -90,6 +90,19 @@ ffmpeg -y -f lavfi -i "$VSRC" -f lavfi -i "$ASRC" \
   -movflags +frag_keyframe+empty_moov+default_base_moof \
   "$OUTDIR/h264-opus-frag.mp4" 2>/dev/null
 
+# Two video renditions in one fMP4: AV1 source (track 1) + smaller H.264
+# fallback (track 2), keyframes aligned at 1s GoPs, plus Opus.
+echo "  av1-h264-opus-frag.mp4"
+ffmpeg -y -f lavfi -i "$VSRC" -f lavfi -i "$ASRC" \
+  -filter_complex "[0:v]split[a][b];[b]scale=160:120[s]" \
+  -map "[a]" -map "[s]" -map 1:a \
+  -c:v:0 libsvtav1 -preset:v:0 8 -crf:v:0 45 \
+  -c:v:1 libx264 -preset:v:1 ultrafast -crf:v:1 28 -sc_threshold 0 \
+  -g 30 -keyint_min 30 \
+  -c:a libopus -b:a 64k \
+  -movflags +frag_keyframe+empty_moov+default_base_moof \
+  "$OUTDIR/av1-h264-opus-frag.mp4" 2>/dev/null
+
 # Two AAC alternatives with ffmpeg's raw trak/udta/name title metadata.
 echo "  aac-two-track-labeled-frag.mp4"
 ffmpeg -y -f lavfi -i "$ASRC" \

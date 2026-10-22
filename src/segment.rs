@@ -160,16 +160,18 @@ pub fn segment_fmp4_with_options<R: Read>(
     let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
     let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
     let mut track_samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
-    let has_video = !video_track_ids.is_empty();
+    // Segments open at the source (first) video track's keyframes; other
+    // video renditions ride along inside its GoPs.
+    let source_video_track = video_track_ids.iter().min().copied();
     let mut segment_number: u32 = 0;
     let mut seen_first_keyframe = false;
 
     while let Some(frame) = fmp4.next_frame()? {
-        let is_video_keyframe = video_track_ids.contains(&frame.track_id) && frame.is_sync;
+        let is_video_keyframe = Some(frame.track_id) == source_video_track && frame.is_sync;
 
-        // A new segment opens at each video keyframe (after the first), or —
-        // for audio-only streams — at each 1-second wall-clock span.
-        let boundary = if has_video {
+        // A new segment opens at each source video keyframe (after the
+        // first), or — for audio-only streams — at each 1-second wall-clock span.
+        let boundary = if source_video_track.is_some() {
             is_video_keyframe && seen_first_keyframe
         } else {
             audio_only_boundary(&track_durations, &track_timescales)
@@ -644,20 +646,11 @@ mod tests {
         assert!(saw_moof, "expected at least one moof in the remapped track's segment");
     }
 
-    #[test]
-    fn test_video_segments_start_with_keyframe() {
-        let data = read_fixture("h264-opus-frag.mp4");
-
-        let mut gops = Vec::new();
-        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
-            gops.push(gop);
-            Ok(())
-        })
-        .unwrap();
-
+    /// Assert every video track's data in each GOP starts with a sync sample.
+    fn assert_video_segments_start_with_keyframe(catalog: &Catalog, gops: &[GopSegment]) {
         let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
 
-        for gop in &gops {
+        for gop in gops {
             for (&track_id, track_data) in &gop.tracks {
                 if !video_track_ids.contains(&track_id) {
                     continue;
@@ -688,6 +681,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_video_segments_start_with_keyframe() {
+        let data = read_fixture("h264-opus-frag.mp4");
+
+        let mut gops = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_video_segments_start_with_keyframe(&catalog, &gops);
+    }
+
+    #[test]
+    fn test_multi_video_segments_cut_at_source_keyframes() {
+        // AV1 source (track 1) + H.264 fallback (track 2) + Opus, 2s with
+        // aligned 1s GoPs: only the source track's keyframes cut, so each
+        // GOP carries all three tracks.
+        let data = read_fixture("av1-h264-opus-frag.mp4");
+
+        let mut gops = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(catalog.video_configs().count(), 2);
+        assert_eq!(gops.len(), 2, "expected one GOP per source keyframe");
+        for gop in &gops {
+            assert_eq!(
+                gop.tracks.keys().copied().collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "GOP {} should carry both video tracks and audio",
+                gop.number
+            );
+        }
+        assert_video_segments_start_with_keyframe(&catalog, &gops);
     }
 
     #[test]
