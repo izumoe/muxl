@@ -174,6 +174,8 @@ func (e *WASMEngine) runWith(
 	initCh, segCh chan<- []byte,
 	eventCh chan<- *Event,
 ) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	instanceID := e.counter.Add(1)
 	instanceName := fmt.Sprintf("muxl-%d", instanceID)
 
@@ -188,7 +190,7 @@ func (e *WASMEngine) runWith(
 
 	cfg := wazero.NewModuleConfig().
 		WithName(instanceName).
-		WithStderr(&logWriter{logger: e.logger, instance: instanceName}).
+		WithStderr(&logWriter{ctx: runCtx, logger: e.logger, instance: instanceName}).
 		WithArgs(args...)
 	if realClock {
 		cfg = cfg.
@@ -201,9 +203,9 @@ func (e *WASMEngine) runWith(
 		cfg = cfg.WithFSConfig(fsCfg)
 	}
 
+	var stdinReader *io.PipeReader
 	var stdinWriter *io.PipeWriter
 	if input != nil {
-		var stdinReader *io.PipeReader
 		stdinReader, stdinWriter = io.Pipe()
 		cfg = cfg.WithStdin(stdinReader)
 	}
@@ -217,6 +219,21 @@ func (e *WASMEngine) runWith(
 	} else if stdout != nil {
 		cfg = cfg.WithStdout(stdout)
 	}
+	closePipes := func() {
+		if stdinReader != nil {
+			stdinReader.Close()
+			stdinWriter.Close()
+		}
+		if stdoutReader != nil {
+			stdoutReader.Close()
+			stdoutWriter.Close()
+		}
+	}
+	stopClose := context.AfterFunc(runCtx, closePipes)
+	defer func() {
+		stopClose()
+		closePipes()
+	}()
 
 	allocator := &muxlAllocator{
 		logger:       e.logger,
@@ -227,15 +244,15 @@ func (e *WASMEngine) runWith(
 
 	errCh := make(chan error, 1)
 	go func() {
-		instCtx := experimental.WithMemoryAllocator(ctx, allocator)
+		instCtx := experimental.WithMemoryAllocator(runCtx, allocator)
 		instance, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
-		if err != nil {
+		if err != nil && runCtx.Err() == nil {
 			e.logger.ErrorContext(ctx, "muxl: instantiate module", "instance", instanceName, "error", err)
 		}
 		// wazero leaves the module registered on clean exit; close it to free
 		// the wasm memory (otherwise each call leaks ~10MB).
 		if instance != nil {
-			if closeErr := instance.Close(ctx); closeErr != nil {
+			if closeErr := instance.Close(context.WithoutCancel(runCtx)); closeErr != nil && runCtx.Err() == nil {
 				e.logger.ErrorContext(ctx, "muxl: close instance", "instance", instanceName, "error", closeErr)
 			}
 		}
@@ -248,20 +265,30 @@ func (e *WASMEngine) runWith(
 	if input != nil {
 		go func() {
 			_, err := io.Copy(stdinWriter, input)
-			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) && runCtx.Err() == nil {
 				e.logger.ErrorContext(ctx, "muxl: copy input to stdin", "instance", instanceName, "error", err)
 			}
 			stdinWriter.Close()
 		}()
 	}
 
+	var parseErr error
 	if parse {
-		if err := parseEvents(ctx, stdoutReader, initCh, segCh, eventCh); err != nil {
-			return fmt.Errorf("muxl: parsing events: %w", err)
-		}
+		parseErr = parseEvents(runCtx, stdoutReader, initCh, segCh, eventCh)
+		// The module may still be writing when parsing stops. Close owned I/O
+		// before joining execution so neither side waits for an absent reader.
+		cancel()
+		closePipes()
 	}
 
-	if wasmErr := <-errCh; wasmErr != nil {
+	wasmErr := <-errCh
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if parseErr != nil {
+		return fmt.Errorf("muxl: parsing events: %w", parseErr)
+	}
+	if wasmErr != nil {
 		return fmt.Errorf("muxl: wasm execution: %w", wasmErr)
 	}
 	return nil
@@ -326,12 +353,16 @@ func parseEvents(ctx context.Context, r io.Reader, initCh, segCh chan<- []byte, 
 // logWriter adapts the wasm's stderr to slog, one record per line. Lines
 // tagged "Error:" / "thread '" surface at error level; the rest at debug.
 type logWriter struct {
+	ctx      context.Context
 	logger   *slog.Logger
 	instance string
 	buf      []byte
 }
 
 func (w *logWriter) Write(p []byte) (int, error) {
+	if w.ctx.Err() != nil {
+		return len(p), nil
+	}
 	w.buf = append(w.buf, p...)
 	for {
 		i := bytes.IndexByte(w.buf, '\n')
