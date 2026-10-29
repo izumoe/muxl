@@ -1,7 +1,6 @@
-//! End-to-end test for [`muxl_sign::sign_transcode_segment`]: prove that a
-//! transcoded output segment's signed manifest declares the segment it was
-//! transcoded from as a `parentOf` ingredient, bound to a `c2pa.transcoded`
-//! action — the C2PA-spec provenance link a Livepeer orchestrator would emit.
+//! End-to-end tests for [`muxl_sign::sign_transcode_segment`]: a transcoded
+//! output preserves each original source asset's provenance, with one parent
+//! and any additional components bound to the transcode action.
 //!
 //! Both segments come from the same fMP4 fixture (a stand-in for a real
 //! transcode, which would change resolution): the "source" is signed first so
@@ -59,10 +58,9 @@ fn map_get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// Sign the fixture through the streaming signer and return the first signed
-/// per-track canonical `.m4s` buffer — a fully S2PA-signed segment, used here
-/// as the transcode *source* (parent ingredient with its own provenance).
-fn signed_source_segment() -> Vec<u8> {
+/// Sign the fixture through the streaming signer and return the first track's
+/// signed canonical assets, each with its own provenance.
+fn signed_source_segments() -> Vec<Vec<u8>> {
     const MANIFEST: &str = r#"{
         "title": "muxl-sign transcode source",
         "assertions": [
@@ -82,17 +80,22 @@ fn signed_source_segment() -> Vec<u8> {
     )
     .expect("sign_segment_stream");
 
+    let mut segments = Vec::new();
     for ev in cbor_values(&output) {
         if map_get(&ev, "type") != Some(&Value::Text("signed-segment".into())) {
             continue;
         }
         if let Some(Value::Map(tracks)) = map_get(&ev, "tracks") {
             if let Some((_tid, Value::Bytes(b))) = tracks.iter().next() {
-                return b.clone();
+                segments.push(b.clone());
             }
         }
     }
-    panic!("no signed-segment track bytes produced");
+    assert!(
+        !segments.is_empty(),
+        "no signed-segment track bytes produced"
+    );
+    segments
 }
 
 /// Segment the fixture into bare canonical `.m4s` segments and return the
@@ -115,7 +118,7 @@ fn unsigned_output_segment() -> Vec<u8> {
 
 #[test]
 fn transcode_output_declares_source_as_parent_ingredient() {
-    let source = signed_source_segment();
+    let source = signed_source_segments().remove(0);
     let output = unsigned_output_segment();
 
     // The output manifest opens the source ingredient and records the
@@ -165,7 +168,11 @@ fn transcode_output_declares_source_as_parent_ingredient() {
             .iter()
             .any(|a| a.action() == c2pa::assertions::c2pa_action::TRANSCODED),
         "manifest carries a c2pa.transcoded action; actions = {:?}",
-        actions.actions().iter().map(|a| a.action()).collect::<Vec<_>>()
+        actions
+            .actions()
+            .iter()
+            .map(|a| a.action())
+            .collect::<Vec<_>>()
     );
 
     // 3) That action resolved its ingredient reference to the parent: the
@@ -196,4 +203,107 @@ fn transcode_output_declares_source_as_parent_ingredient() {
         "signed transcode output should validate; status = {:?}",
         reader.validation_status()
     );
+}
+
+#[test]
+fn transcode_output_preserves_each_source_manifest() {
+    let sources = signed_source_segments();
+    assert!(
+        sources.len() >= 2,
+        "fixture must cross a canonical boundary"
+    );
+    let sources = &sources[..2];
+    let source_labels: Vec<_> = sources
+        .iter()
+        .map(|source| {
+            let reader = Reader::from_stream("m4s", Cursor::new(source)).expect("source reader");
+            reader
+                .active_manifest()
+                .expect("source manifest")
+                .label()
+                .expect("manifest label")
+                .to_string()
+        })
+        .collect();
+    assert_ne!(source_labels[0], source_labels[1]);
+    let source = sources.concat();
+    let manifest = format!(
+        r#"{{
+            "title": "assembled transcode output",
+            "assertions": [{{ "label": "c2pa.actions", "data": {{ "actions": [
+                {{ "action": "c2pa.opened",
+                   "parameters": {{ "org.cai.ingredientIds": ["{label}"] }} }},
+                {{ "action": "c2pa.transcoded",
+                   "parameters": {{ "org.cai.ingredientIds": ["{label}"] }} }}
+            ]}} }}]
+        }}"#,
+        label = TRANSCODE_INGREDIENT_LABEL
+    );
+    let signed = sign_transcode_segment(&unsigned_output_segment(), &source, &signer(), &manifest)
+        .expect("sign output derived from both original assets");
+    let reader = Reader::from_stream("m4s", Cursor::new(&signed)).expect("output reader");
+    let active = reader.active_manifest().expect("output manifest");
+    let ingredients = active.ingredients();
+    assert_eq!(ingredients.len(), sources.len());
+    assert_eq!(ingredients[0].relationship(), &Relationship::ParentOf);
+    assert_eq!(ingredients[1].relationship(), &Relationship::ComponentOf);
+    for (ingredient, source_label) in ingredients.iter().zip(source_labels) {
+        assert_eq!(ingredient.active_manifest(), Some(source_label.as_str()));
+        assert!(
+            reader.get_manifest(&source_label).is_some(),
+            "original source manifest must be embedded"
+        );
+    }
+    let actions: Actions = active
+        .find_assertion(Actions::LABEL)
+        .expect("output actions");
+    let actions = serde_json::to_value(actions).expect("serialize actions");
+    let actions = actions["actions"].as_array().expect("action list");
+    assert_eq!(actions[0]["action"], "c2pa.opened");
+    assert_eq!(
+        actions[0]["parameters"]["ingredients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let placed = actions
+        .iter()
+        .find(|a| a["action"] == "c2pa.placed")
+        .expect("component placement");
+    assert_eq!(
+        placed["parameters"]["ingredients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let transcoded = actions
+        .iter()
+        .find(|a| a["action"] == "c2pa.transcoded")
+        .expect("transcode action");
+    assert_eq!(
+        transcoded["parameters"]["ingredients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        sources.len()
+    );
+    assert_eq!(
+        reader.validation_state(),
+        ValidationState::Valid,
+        "all source manifest links and output hashes must validate: {:?}",
+        reader.validation_status()
+    );
+}
+
+#[test]
+fn transcode_rejects_empty_source() {
+    let result = sign_transcode_segment(
+        &unsigned_output_segment(),
+        &[],
+        &signer(),
+        r#"{"title":"transcode output","assertions":[]}"#,
+    );
+    assert!(result.is_err(), "a derived asset requires an actual source");
 }

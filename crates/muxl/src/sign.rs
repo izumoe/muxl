@@ -666,21 +666,22 @@ fn sign_buf_as(
 /// the exact source bytes the output was derived from.
 pub const TRANSCODE_INGREDIENT_LABEL: &str = "muxl.source";
 
-/// Sign one transcoded canonical MUXL segment, declaring the segment it was
-/// transcoded from as a `parentOf` ingredient.
+/// Sign one transcoded canonical MUXL segment, preserving the provenance of
+/// each canonical source asset it was derived from.
 ///
-/// `output` is the unsigned canonical MUXL `.m4s` produced by transcoding +
-/// re-segmenting; `source` is the canonical MUXL `.m4s` that was transcoded
-/// (typically itself S2PA-signed, so the provenance chain stays unbroken).
+/// `output` is one unsigned canonical MUXL `.m4s` produced by transcoding +
+/// re-segmenting. `source` contains the original canonical assets concatenated
+/// verbatim (typically S2PA-signed, so the provenance chain stays unbroken).
+/// The first source is a `parentOf` ingredient; further sources are `componentOf`
+/// ingredients with placement actions supplied by the signing SDK.
 /// `segment_manifest` is a C2PA manifest JSON that should carry a
 /// `c2pa.actions` assertion whose `c2pa.transcoded` action references the
-/// source via [`TRANSCODE_INGREDIENT_LABEL`] (see that constant's docs).
+/// source via [`TRANSCODE_INGREDIENT_LABEL`]. That transcode reference expands
+/// to all source ingredients; an opened action still references the first.
 ///
 /// Returns the signed output — `[c2pa-uuid][muxl-uuid][moof][mdat]…` — which
-/// verifies standalone as an `m4s` asset and whose manifest names `source`
-/// as its parent. This is the provenance step a Livepeer orchestrator runs
-/// after transcoding a signed MUXL segment: the output carries, in its own
-/// signed claim, the identity of the exact input it came from.
+/// verifies standalone as an `m4s` asset. Sign each output canonical asset
+/// independently; a concatenation of outputs is not one signable asset.
 ///
 /// Per-segment time is stamped into `cawg.metadata`/`dc:date` exactly as in
 /// [`sign_segment_stream`], so each signed `.m4s` holds its own provenance
@@ -693,32 +694,89 @@ pub fn sign_transcode_segment(
 ) -> Result<Vec<u8>> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
-    let base: serde_json::Value = serde_json::from_str(segment_manifest)
+    let mut base: serde_json::Value = serde_json::from_str(segment_manifest)
         .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("segment manifest JSON: {e}"))))?;
+    let sources = muxl::reader::unwrap(source)?;
+    if sources.is_empty() {
+        return Err(Error::C2pa(c2pa::Error::BadParam(
+            "transcode source is empty".into(),
+        )));
+    }
+    if sources.len() > 1 {
+        if let Some(assertions) = base
+            .get_mut("assertions")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for assertion in assertions {
+                if !assertion
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|label| label.starts_with("c2pa.actions"))
+                {
+                    continue;
+                }
+                if let Some(actions) = assertion
+                    .pointer_mut("/data/actions")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for action in actions {
+                        if action.get("action").and_then(serde_json::Value::as_str)
+                            != Some("c2pa.transcoded")
+                        {
+                            continue;
+                        }
+                        if let Some(ids) = action
+                            .pointer_mut("/parameters/org.cai.ingredientIds")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            if ids
+                                .iter()
+                                .any(|id| id.as_str() == Some(TRANSCODE_INGREDIENT_LABEL))
+                            {
+                                ids.extend((1..sources.len()).map(|i| {
+                                    serde_json::Value::String(format!(
+                                        "{TRANSCODE_INGREDIENT_LABEL}.{i}"
+                                    ))
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let manifest = stamp_segment_manifest(&base, &now_rfc3339_utc());
-    sign_buf_as_transcode(output, source, &manifest, &*c2pa_signer, "m4s")
+    sign_buf_as_transcode(output, &sources, &manifest, &*c2pa_signer, "m4s")
 }
 
-/// Sign `output` as a standalone asset that declares `source` as a
-/// `parentOf` ingredient. Sibling of [`sign_buf_as`] with the ingredient
-/// step added: c2pa-rs hashes `source` (and pulls in its manifest, if it's
-/// signed) and records it as the parent, then the manifest's actions bind to
-/// it via [`TRANSCODE_INGREDIENT_LABEL`].
+/// Sign `output` as a standalone asset with each original source ingredient
+/// and its embedded provenance, bound to the manifest's transcode action.
 fn sign_buf_as_transcode(
     output: &[u8],
-    source: &[u8],
+    sources: &[muxl::reader::Segment<'_>],
     manifest: &str,
     signer: &dyn C2paSigner,
     format: &str,
 ) -> Result<Vec<u8>> {
     let mut builder = Builder::from_json(manifest)?;
 
-    // `source` is the parent ingredient: `output` is a transcode *of* it. The
-    // label lets the manifest's actions reference this ingredient by id.
-    let ingredient_json = format!(
-        r#"{{"title":"source segment","relationship":"parentOf","label":"{TRANSCODE_INGREDIENT_LABEL}"}}"#
-    );
-    builder.add_ingredient_from_stream(ingredient_json, format, &mut Cursor::new(source))?;
+    for (i, source) in sources.iter().enumerate() {
+        // C2PA permits one parent. Further canonical assets are components;
+        // the SDK records their placement actions and preserves each manifest.
+        let (relationship, label) = if i == 0 {
+            ("parentOf", TRANSCODE_INGREDIENT_LABEL.to_string())
+        } else {
+            ("componentOf", format!("{TRANSCODE_INGREDIENT_LABEL}.{i}"))
+        };
+        let ingredient_json = format!(
+            r#"{{"title":"source segment","relationship":"{relationship}","label":"{label}"}}"#
+        );
+        builder.add_ingredient_from_stream(
+            ingredient_json,
+            format,
+            &mut Cursor::new(source.data),
+        )?;
+    }
 
     let mut asset = Cursor::new(output);
     let mut signed: Vec<u8> = Vec::new();

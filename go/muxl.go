@@ -52,10 +52,12 @@ type Engine interface {
 	SignSegment(ctx context.Context, input io.Reader, in SignerInput, init, seg chan<- []byte, events chan<- *Event) error
 
 	// SignTranscode signs in.Output — an unsigned canonical MUXL segment, the
-	// result of transcoding — as a standalone asset that declares in.Source
-	// (the canonical MUXL segment it was transcoded from) as a C2PA parentOf
-	// ingredient, bound to a c2pa.transcoded action. Returns the signed
-	// segment. Exactly one of in.KeyPEM or in.Sign must be set.
+	// result of transcoding — as a standalone asset. in.Source may concatenate
+	// canonical source assets: the first is a parentOf ingredient and further
+	// assets are componentOf ingredients, each retaining its original manifest.
+	// A c2pa.transcoded action referencing TranscodeIngredientLabel binds to all
+	// of them. Returns one signed segment; sign output assets individually.
+	// Exactly one of in.KeyPEM or in.Sign must be set.
 	SignTranscode(ctx context.Context, in TranscodeInput) ([]byte, error)
 
 	// GenCert issues an S2PA leaf certificate for the secp256k1 identity in
@@ -188,10 +190,12 @@ type SignerInput struct {
 // TranscodeInput is the signing bundle for [Engine.SignTranscode]. Exactly one
 // of KeyPEM or Sign must be set (same backends as [SignerInput]).
 //
-// Output is the unsigned canonical MUXL .m4s to sign (the transcoded result);
-// Source is the canonical MUXL .m4s it was transcoded from, recorded as a
-// parentOf ingredient. Manifest is the output's C2PA manifest JSON, which
-// should carry a c2pa.transcoded action referencing the source ingredient.
+// Output is one unsigned canonical MUXL .m4s to sign (the transcoded result).
+// Source contains the canonical MUXL .m4s assets it was transcoded from,
+// concatenated verbatim. The first is recorded as a parentOf ingredient and
+// further assets as componentOf ingredients. Manifest is the output's C2PA
+// manifest JSON, which should carry a c2pa.transcoded action referencing
+// TranscodeIngredientLabel; that reference expands to every source asset.
 type TranscodeInput struct {
 	Output   []byte
 	Source   []byte
@@ -231,6 +235,9 @@ type CertInput struct {
 //	  {"action":"c2pa.transcoded","parameters":{"org.cai.ingredientIds":["muxl.source"]}}
 //	]}}
 //
+// For concatenated sources, c2pa.opened references the first parent and
+// c2pa.transcoded expands this label to all source ingredients. The signing
+// SDK adds the c2pa.placed actions required by componentOf ingredients.
 // It must match muxl's TRANSCODE_INGREDIENT_LABEL.
 const TranscodeIngredientLabel = "muxl.source"
 
