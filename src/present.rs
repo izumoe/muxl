@@ -90,7 +90,7 @@ pub fn write_fmp4<'a, W: Write>(
 /// `mdat` envelope.
 ///
 /// `first_decode_times` is the presentation anchor (per track media ticks) for
-/// the first GoP — used to synthesize an `elst` when a VOD starts mid-stream;
+/// each track's first sample — used to synthesize an `elst` when a VOD starts mid-stream;
 /// pass an empty map for a stream that starts at time zero.
 ///
 /// This is the segment-native equivalent of [`crate::flat::write`] and
@@ -102,16 +102,16 @@ pub fn write_flat<W: Write>(
     out: &mut W,
 ) -> Result<()> {
     let mut metas: Vec<SegmentMetadata> = Vec::with_capacity(gops.len());
-    for (gi, gop) in gops.iter().enumerate() {
+    for gop in gops {
         let mut meta = SegmentMetadata::default();
         for (&tid, bytes) in &gop.tracks {
             meta.track_byte_sizes.insert(tid, bytes.len() as u64);
             if let Some(ts) = gop.samples.get(&tid) {
                 meta.samples.insert(tid, ts.clone());
             }
-        }
-        if gi == 0 {
-            meta.first_decode_times = first_decode_times.clone();
+            if let Some(&dts) = first_decode_times.get(&tid) {
+                meta.first_decode_times.insert(tid, dts);
+            }
         }
         metas.push(meta);
     }
@@ -135,7 +135,7 @@ pub fn write_flat<W: Write>(
 ///
 /// `segments` must be in interleave order (per GoP, tracks ascending), which
 /// is exactly what `unwrap` produces. The presentation anchor (`elst`) is
-/// derived from the first GoP's segment `tfdt`s. Byte-identical to
+/// derived from each track's first segment `tfdt`. Byte-identical to
 /// [`crate::flat::write`] for the same content.
 pub fn write_flat_from_m4s<W: Write>(
     catalog: &Catalog,
@@ -146,7 +146,6 @@ pub fn write_flat_from_m4s<W: Write>(
     // the previous one (tracks ascend within a GoP; a single-track stream
     // makes every segment its own GoP).
     let mut metas: Vec<SegmentMetadata> = Vec::new();
-    let mut first_decode_times: BTreeMap<u32, u64> = BTreeMap::new();
     let mut last_tid: Option<u32> = None;
     for seg in segments {
         let (tid, ts, dts) = segment_index(seg)?;
@@ -156,13 +155,8 @@ pub fn write_flat_from_m4s<W: Write>(
         let meta = metas.last_mut().unwrap();
         meta.track_byte_sizes.insert(tid, seg.len() as u64);
         meta.samples.insert(tid, ts);
-        if metas.len() == 1 {
-            first_decode_times.entry(tid).or_insert(dts);
-        }
+        meta.first_decode_times.insert(tid, dts);
         last_tid = Some(tid);
-    }
-    if let Some(first) = metas.first_mut() {
-        first.first_decode_times = first_decode_times;
     }
 
     out.write_all(&flat_header(catalog, &metas)?)?;
@@ -308,6 +302,51 @@ mod tests {
             flat_mine, flat_ref,
             "present::write_flat must match flat::write byte-for-byte"
         );
+    }
+
+    #[test]
+    fn write_flat_from_m4s_preserves_later_tracks_start_times() {
+        let data = read_fixture("h264-opus-frag.mp4");
+        let mut source = crate::read(&data).unwrap();
+        for track in &mut source.plan.tracks {
+            let skew_ms = if track.is_video { 50 } else { 10 };
+            track.start_offset_ticks = (10_000 + skew_ms) * track.timescale as u64 / 1000;
+        }
+        let mut reference = Vec::new();
+        crate::flat::write(&source, &data, &mut reference).unwrap();
+        let mut segments = reader::unwrap(&reference).unwrap();
+        let catalog = reader::aggregate_catalog(&segments);
+        // A track can first appear after a repeated earlier track has already
+        // begun a new metadata group, as with independently delivered tracks.
+        segments.sort_by_key(|segment| segment_index(segment.data).unwrap().0);
+        let slices: Vec<&[u8]> = segments.iter().map(|segment| segment.data).collect();
+        assert!(slices.len() >= 4);
+        assert_eq!(segment_index(slices[0]).unwrap().0, segment_index(slices[1]).unwrap().0);
+        let mut actual = Vec::new();
+        write_flat_from_m4s(&catalog, &slices, &mut actual).unwrap();
+        let expected_moov = crate::init::read_moov(&mut Cursor::new(&reference)).unwrap();
+        let actual_moov = crate::init::read_moov(&mut Cursor::new(&actual)).unwrap();
+        assert_eq!(actual_moov.mvhd.duration, expected_moov.mvhd.duration);
+        for trak in &actual_moov.trak {
+            let expected = expected_moov.trak.iter()
+                .find(|expected| expected.tkhd.track_id == trak.tkhd.track_id).unwrap();
+            assert_eq!(trak.tkhd.duration, expected.tkhd.duration);
+            assert_eq!(trak.mdia.mdhd.duration, expected.mdia.mdhd.duration);
+            let edit = trak.edts.as_ref().and_then(|edit| edit.elst.as_ref());
+            if catalog.track(trak.tkhd.track_id).unwrap().group == "video" {
+                let edit = edit.unwrap();
+                assert_eq!(edit.entries[0].segment_duration, 40);
+                assert_eq!(edit.entries[0].media_time, u64::MAX);
+                assert_eq!(edit.entries[1].media_time, 0);
+            } else {
+                assert!(edit.is_none());
+            }
+        }
+        let recovered = reader::unwrap(&actual).unwrap();
+        assert_eq!(recovered.len(), slices.len());
+        for (recovered, original) in recovered.iter().zip(&slices) {
+            assert!(recovered.data == *original, "canonical bytes and decode times must survive");
+        }
     }
 
     #[test]

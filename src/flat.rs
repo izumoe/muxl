@@ -234,19 +234,9 @@ pub(crate) fn plan_canonical_body(
             }
             meta.track_byte_sizes.insert(tid, size);
             meta.samples.insert(tid, ts);
+            meta.first_decode_times.insert(tid, plan.start_offset_ticks);
         }
         per_gop_metadata.push(meta);
-    }
-
-    // First-GoP first_decode_times — anchors the synthesized elst when a
-    // VOD starts at a non-zero decode time. Subsequent GoPs' values are
-    // ignored by build_synth_flat_header.
-    if !per_gop_metadata.is_empty() {
-        for plan in ordered.iter() {
-            per_gop_metadata[0]
-                .first_decode_times
-                .insert(plan.track_id, plan.start_offset_ticks);
-        }
     }
 
     Ok(CanonicalBodyPlan {
