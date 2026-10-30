@@ -138,11 +138,11 @@ pub struct SegmentMetadata {
     /// Per-track per-sample arrays. Same shape as the wire CBOR's
     /// `samples` field.
     pub samples: std::collections::BTreeMap<u32, crate::segment::TrackSamples>,
-    /// For the *first* segment of a synth VOD, the decode time of each
-    /// track's first sample. Used to populate the synthesized elst when
+    /// For each track's first segment of a synth VOD, the decode time of its
+    /// first sample. Used to populate the synthesized elst when
     /// the VOD doesn't start at decode_time=0 (e.g. clipped from
     /// mid-stream). Empty / zero-valued for stream-from-start VODs.
-    /// Values on subsequent segments are ignored.
+    /// Values on subsequent segments of the same track are ignored.
     pub first_decode_times: std::collections::BTreeMap<u32, u64>,
 }
 
@@ -469,14 +469,14 @@ pub fn build_synth_flat_header(
     }
 
     // Build TrackPlan-shaped inputs for the existing helpers (populate_stbl,
-    // build_canonical_elst, etc.). start_offset_ticks comes from the first
-    // segment's first_decode_times; if absent, defaults to 0.
-    let first_seg = &segments[0];
+    // build_canonical_elst, etc.). Each track starts at its first segment's
+    // first_decode_times entry; if absent, defaults to 0.
     let mut plans: Vec<TrackPlan> = Vec::with_capacity(known.len());
     for (tid, timescale, is_video) in known {
-        let start_offset_ticks = first_seg
-            .first_decode_times
-            .get(&tid)
+        let start_offset_ticks = segments
+            .iter()
+            .find(|seg| seg.samples.contains_key(&tid))
+            .and_then(|seg| seg.first_decode_times.get(&tid))
             .copied()
             .unwrap_or(0);
         plans.push(TrackPlan {
@@ -1749,6 +1749,67 @@ mod tests {
                     "track {}, sample {}: bytes before co64 offset must be mdat header",
                     trak.tkhd.track_id, i,
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn synth_flat_header_rebases_tracks_first_seen_in_later_segments() {
+        use crate::push::{Segmenter, SegmenterEvent};
+
+        let data = std::fs::read(fixture_path("h264-opus-frag.mp4")).unwrap();
+        let source = crate::read(&data[..]).unwrap();
+        let mut fmp4 = Vec::new();
+        crate::fmp4::write(&source, &data[..], &mut fmp4).unwrap();
+        let mut segmenter = Segmenter::new();
+        let mut events = segmenter.feed(&fmp4).unwrap();
+        events.extend(segmenter.flush().unwrap());
+        let catalog = events.iter().find_map(|event| match event {
+            SegmenterEvent::InitSegment { catalog, .. } => Some(catalog),
+            _ => None,
+        }).unwrap();
+        let gop = events.iter().find_map(|event| match event {
+            SegmenterEvent::Segment(gop) => Some(gop),
+            _ => None,
+        }).unwrap();
+        let mut together = SegmentMetadata::default();
+        let mut separate = Vec::new();
+        for (&tid, bytes) in &gop.tracks {
+            let track = catalog.track(tid).unwrap();
+            // Both tracks start ten seconds into the stream; video lags audio
+            // by 40ms. Splitting their metadata must preserve that skew only.
+            let offset_ms = if track.group == "video" { 10_050 } else { 10_010 };
+            let start = offset_ms * track.timescale as u64 / 1000;
+            together.track_byte_sizes.insert(tid, bytes.len() as u64);
+            together.samples.insert(tid, gop.samples[&tid].clone());
+            together.first_decode_times.insert(tid, start);
+            separate.push(SegmentMetadata {
+                track_byte_sizes: [(tid, bytes.len() as u64)].into(),
+                samples: [(tid, gop.samples[&tid].clone())].into(),
+                first_decode_times: [(tid, start)].into(),
+            });
+        }
+        assert_eq!(separate.len(), 2);
+        let expected = build_synth_flat_header(catalog, &[together]).unwrap();
+        let actual = build_synth_flat_header(catalog, &separate).unwrap();
+        // The body remains in the same track order, so timing and sample-byte
+        // offsets must match the header built with both tracks present at once.
+        assert!(actual == expected, "split metadata must preserve the flat header");
+        separate.insert(0, SegmentMetadata::default());
+        assert!(
+            build_synth_flat_header(catalog, &separate).unwrap() == expected,
+            "empty metadata before the first track must not change the header",
+        );
+        let moov = read_moov(&mut Cursor::new(&actual)).unwrap();
+        for trak in &moov.trak {
+            let edit = trak.edts.as_ref().and_then(|edts| edts.elst.as_ref());
+            if catalog.track(trak.tkhd.track_id).unwrap().group == "video" {
+                let edit = edit.unwrap();
+                assert_eq!(edit.entries[0].segment_duration, 40);
+                assert_eq!(edit.entries[0].media_time, u64::MAX);
+                assert_eq!(edit.entries[1].media_time, 0);
+            } else {
+                assert!(edit.is_none());
             }
         }
     }
