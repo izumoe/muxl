@@ -51,7 +51,8 @@ On 64-bit Unix, linear memory reserves virtual address space up to the
 `WithMemory` ceiling. Pages become accessible as the module grows, and only
 touched pages consume physical memory. The mapping is released after execution
 returns, without waiting for Go's garbage collector. This backing is outside
-Go heap metrics; monitor process residency as well as Go allocations.
+Go heap metrics and Go's soft memory limit; monitor process residency as well
+as Go allocations. The `WithMemory` ceiling still bounds each module.
 
 Other platforms, or a failed address-space reservation, use the existing
 geometrically growing Go buffer. The initial size in `WithMemory` controls
