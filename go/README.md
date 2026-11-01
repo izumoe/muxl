@@ -42,6 +42,26 @@ All operations live behind the [`Engine`](muxl.go) interface, so the WASM
 backend can be swapped for a natively-linked Rust build later without touching
 callers.
 
+### Memory
+
+Reuse an engine: it compiles the embedded module once, while each operation
+gets a fresh, isolated module with zero-initialized memory.
+
+On 64-bit Unix, linear memory reserves virtual address space up to the
+`WithMemory` ceiling. Pages become accessible as the module grows, and only
+touched pages consume physical memory. The mapping is released after execution
+returns, without waiting for Go's garbage collector. This backing is outside
+Go heap metrics; monitor process residency as well as Go allocations.
+
+Other platforms, or a failed address-space reservation, use the existing
+geometrically growing Go buffer. The initial size in `WithMemory` controls
+that fallback; the maximum remains the per-module growth ceiling everywhere.
+Reservation failures are logged.
+
+Closing an engine does not forcibly release memory still used by a host
+callback. The callback must return before its operation can release that
+memory. Signing callbacks receive Go-owned bytes they may retain.
+
 ### Transcode provenance
 
 `SignTranscode` signs a transcoded output segment so its C2PA manifest names the

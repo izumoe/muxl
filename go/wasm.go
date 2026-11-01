@@ -59,7 +59,9 @@ type Option func(*WASMEngine)
 
 // WithMemory sets the wasm linear-memory tuning: initial backing-buffer
 // capacity and a hard ceiling (a module that grows past max fails its
-// memory.grow). Defaults are 50 MiB / 1 GiB.
+// memory.grow). Defaults are 50 MiB / 1 GiB. On 64-bit Unix, the ceiling is
+// reserved as virtual address space and pages become accessible on demand;
+// initial controls the Go heap fallback on other platforms or mapping failure.
 func WithMemory(initial, max uint64) Option {
 	return func(e *WASMEngine) { e.memInitial, e.memMax = initial, max }
 }

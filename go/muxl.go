@@ -163,6 +163,7 @@ func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
 //     contract (for ECDSA: it receives the unhashed bytes and returns raw
 //     r‖s). Use this for hardware- or keystore-backed signers whose key bytes
 //     never leave the host — e.g. a Livepeer orchestrator's Ethereum keystore.
+//     The callback owns its input bytes and may retain them after returning.
 //     See [SignerToCallback].
 //
 // CertPEM is the cert chain (PEM, leaf first). TrackManifest/WrapperManifest
@@ -221,6 +222,7 @@ type CertInput struct {
 	// Sign signs the certificate: it receives the (unhashed) TBSCertificate
 	// DER and must return the ECDSA-SHA256 signature as raw r‖s (or the
 	// 65-byte r‖s‖v Ethereum form). Wrap a keystore with RawSignerToCallback.
+	// The callback owns its input bytes and may retain them after returning.
 	Sign func(data []byte) ([]byte, error)
 }
 

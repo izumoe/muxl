@@ -24,9 +24,9 @@ const (
 	keyPath     = "../samples/test-keys/es256k-key.pem"
 )
 
-func newEngine(t *testing.T) *muxl.WASMEngine {
+func newEngine(t testing.TB, opts ...muxl.Option) *muxl.WASMEngine {
 	t.Helper()
-	eng, err := muxl.NewWASM(context.Background())
+	eng, err := muxl.NewWASM(context.Background(), opts...)
 	if err != nil {
 		t.Fatalf("NewWASM: %v", err)
 	}
@@ -34,7 +34,7 @@ func newEngine(t *testing.T) *muxl.WASMEngine {
 	return eng
 }
 
-func readFile(t *testing.T, path string) []byte {
+func readFile(t testing.TB, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -43,7 +43,7 @@ func readFile(t *testing.T, path string) []byte {
 	return b
 }
 
-func signerInput(t *testing.T) muxl.SignerInput {
+func signerInput(t testing.TB) muxl.SignerInput {
 	manifest := []byte(`{
 		"title": "muxl-go test",
 		"assertions": [
@@ -95,7 +95,7 @@ func firstTrackBytes(events []*muxl.Event, typ string) []byte {
 // firstSignedSegment signs the fixture and returns a single signed canonical
 // segment (the first track of the first GoP) — the shape of one transcode
 // source ingredient.
-func firstSignedSegment(t *testing.T, eng *muxl.WASMEngine) []byte {
+func firstSignedSegment(t testing.TB, eng *muxl.WASMEngine) []byte {
 	t.Helper()
 	frag := readFile(t, fixtureFmp4)
 	in := signerInput(t)
@@ -114,7 +114,7 @@ func firstSignedSegment(t *testing.T, eng *muxl.WASMEngine) []byte {
 
 // signedM4sStream signs the fixture and concatenates every signed per-track
 // segment into one bare .m4s byte stream — the storage/wire form.
-func signedM4sStream(t *testing.T, eng *muxl.WASMEngine) []byte {
+func signedM4sStream(t testing.TB, eng *muxl.WASMEngine) []byte {
 	t.Helper()
 	frag := readFile(t, fixtureFmp4)
 	in := signerInput(t)

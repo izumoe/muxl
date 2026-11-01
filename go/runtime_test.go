@@ -3,6 +3,7 @@ package muxl
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,71 @@ import (
 	"testing"
 	"time"
 )
+
+func certificateTestKey(t *testing.T) []byte {
+	t.Helper()
+	// The secp256k1 generator is a valid public key; these tests exercise
+	// callback ownership and failure cleanup, not signature verification.
+	key, err := hex.DecodeString("0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestSignerInputSurvivesFailedOperation(t *testing.T) {
+	var logs bytes.Buffer
+	engine, err := NewWASM(t.Context(), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { engine.Close(context.Background()) })
+	var retained, saved []byte
+	_, err = engine.GenCert(t.Context(), CertInput{PubKey: certificateTestKey(t), Sign: func(data []byte) ([]byte, error) {
+		retained, saved = data, bytes.Clone(data)
+		return nil, errors.New("intentional signing failure")
+	}})
+	if err == nil || len(retained) == 0 || !bytes.Equal(retained, saved) {
+		t.Fatal("failed operation must leave callback-owned input valid")
+	}
+	if !strings.Contains(logs.String(), "intentional signing failure") {
+		t.Fatalf("expected callback failure was not captured: %s", &logs)
+	}
+}
+
+func TestCloseDuringSignerCallback(t *testing.T) {
+	var logs bytes.Buffer
+	engine, err := NewWASM(t.Context(), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { engine.Close(context.Background()) })
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.GenCert(t.Context(), CertInput{PubKey: certificateTestKey(t), Sign: func(data []byte) ([]byte, error) {
+			close(entered)
+			<-release
+			return bytes.Repeat([]byte{1}, 64), nil
+		}})
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WASM did not enter signer callback")
+	}
+	if err := engine.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closed operation did not join its host callback")
+	}
+}
 
 func TestStreamingCancellationClosesOwnedPipes(t *testing.T) {
 	logs, err := os.CreateTemp(t.TempDir(), "muxl.log")

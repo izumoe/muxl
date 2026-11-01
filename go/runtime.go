@@ -44,7 +44,8 @@ func (e *WASMEngine) hostSign(ctx context.Context, mod api.Module, dataPtr, data
 		e.logger.ErrorContext(ctx, "muxl host_sign: bad data pointer", "instance", mod.Name())
 		return hostSignErr
 	}
-	sig, err := signFn(data)
+	// Callbacks may retain their input after the module's memory is released.
+	sig, err := signFn(bytes.Clone(data))
 	if err != nil {
 		e.logger.ErrorContext(ctx, "muxl host_sign: signer returned error", "instance", mod.Name(), "error", err)
 		return hostSignErr
@@ -93,14 +94,14 @@ func (e *WASMEngine) hostGetManifest(ctx context.Context, mod api.Module, kind, 
 	return n
 }
 
-// muxlAllocator pre-allocates the wasm linear-memory backing buffer and grows
-// it geometrically, avoiding wazero's default realloc+memcpy on every page so
-// a segment that ends up at tens of MB doesn't allocate gigabytes on the way.
+// muxlAllocator uses demand-paged mappings where available. Other platforms
+// retain a geometrically growing Go buffer instead of copying on every page.
 type muxlAllocator struct {
 	logger       *slog.Logger
 	instanceName string
 	initialBytes uint64
 	maxBytes     uint64
+	memories     []*muxlLinearMemory
 }
 
 func (a *muxlAllocator) Allocate(capHint, wasmMax uint64) experimental.LinearMemory {
@@ -115,12 +116,35 @@ func (a *muxlAllocator) Allocate(capHint, wasmMax uint64) experimental.LinearMem
 	if initial > effectiveMax {
 		initial = effectiveMax
 	}
-	return &muxlLinearMemory{
+	mapping, err := reserveMemory(effectiveMax)
+	if err != nil {
+		a.logger.Warn("muxl memory reservation failed; using Go heap", "instance", a.instanceName, "error", err)
+	}
+	memory := &muxlLinearMemory{
 		logger:       a.logger,
 		instanceName: a.instanceName,
-		buf:          make([]byte, 0, initial),
 		max:          effectiveMax,
+		mapping:      mapping,
 	}
+	if mapping != nil {
+		memory.buf = mapping[:0]
+	} else {
+		memory.buf = make([]byte, 0, initial)
+	}
+	a.memories = append(a.memories, memory)
+	return memory
+}
+
+func (a *muxlAllocator) release() {
+	for _, memory := range a.memories {
+		if memory.mapping != nil {
+			if err := releaseMemory(memory.mapping); err != nil {
+				a.logger.Error("muxl memory release failed", "instance", a.instanceName, "error", err)
+			}
+		}
+		memory.mapping, memory.buf = nil, nil
+	}
+	a.memories = nil
 }
 
 type muxlLinearMemory struct {
@@ -128,12 +152,21 @@ type muxlLinearMemory struct {
 	instanceName string
 	buf          []byte
 	max          uint64
+	mapping      []byte
 }
 
 func (m *muxlLinearMemory) Reallocate(size uint64) []byte {
 	if size > m.max {
 		m.logger.Error("muxl memory cap exceeded", "instance", m.instanceName, "requested_bytes", size, "max_bytes", m.max)
 		return nil
+	}
+	if m.mapping != nil {
+		if err := commitMemory(m.mapping, uint64(len(m.buf)), size); err != nil {
+			m.logger.Error("muxl memory growth failed", "instance", m.instanceName, "requested_bytes", size, "error", err)
+			return nil
+		}
+		m.buf = m.mapping[:size]
+		return m.buf
 	}
 	if size <= uint64(cap(m.buf)) {
 		m.buf = m.buf[:size]
@@ -152,7 +185,10 @@ func (m *muxlLinearMemory) Reallocate(size uint64) []byte {
 	return m.buf
 }
 
-func (m *muxlLinearMemory) Free() { m.buf = nil }
+func (m *muxlLinearMemory) Free() {
+	// Module.Close can run during a host callback. All backing storage is
+	// released by its allocator only after execution has returned.
+}
 
 // runWith instantiates the precompiled module with the given args and optional
 // read-only FS mount. If any of initCh/segCh/eventCh is non-nil, stdout is
@@ -244,6 +280,14 @@ func (e *WASMEngine) runWith(
 
 	errCh := make(chan error, 1)
 	go func() {
+		var err error
+		defer func() {
+			allocator.release()
+			if stdoutWriter != nil {
+				stdoutWriter.Close()
+			}
+			errCh <- err
+		}()
 		instCtx := experimental.WithMemoryAllocator(runCtx, allocator)
 		instance, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
 		if err != nil && runCtx.Err() == nil {
@@ -256,10 +300,6 @@ func (e *WASMEngine) runWith(
 				e.logger.ErrorContext(ctx, "muxl: close instance", "instance", instanceName, "error", closeErr)
 			}
 		}
-		if stdoutWriter != nil {
-			stdoutWriter.Close()
-		}
-		errCh <- err
 	}()
 
 	if input != nil {
