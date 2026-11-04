@@ -80,7 +80,7 @@ Modifying the catalog or any fragment changes the canonical segment's bytes, whi
 
 ### Segmentation Rule
 
-Segment boundaries are driven by video sync samples (keyframes). A new segment begins at each video keyframe. Samples of every non-video track — audio, or a newer type such as text — are grouped with the video GoP they temporally overlap.
+Segment boundaries are driven by video sync samples (keyframes). Each video track starts its own segment at its own keyframe; a keyframe from another rendition must not split that track’s GoP. A streaming batch bundles one complete GoP from each video track. Samples of non-video tracks are assigned by decode time to the first video track’s GoP interval, retaining any packet that crosses the boundary whole. At end of stream, trailing audio stays with the final video batch.
 
 For audio-only streams (no video reference), segments are 1-second wall-clock spans.
 

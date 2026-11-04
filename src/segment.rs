@@ -7,7 +7,7 @@
 //!
 //! Spec: architecture.md § MUXL Segment
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read;
 
 use crate::catalog::{Catalog, to_drisl};
@@ -133,171 +133,209 @@ pub fn segment_fmp4_with_remap<R: Read>(
     let mut fmp4 = FMP4Reader::with_remap(reader, remap)?;
     let catalog = fmp4.catalog().clone();
 
-    // Determine which track IDs are video (for keyframe detection)
-    let video_track_ids: HashSet<u32> = catalog.video_configs().map(|v| v.track_id()).collect();
-    // Per-track timescales, used to compute segment duration_us.
-    let track_timescales: BTreeMap<u32, u32> = catalog
-        .video_configs()
-        .map(|v| (v.track_id(), v.timescale()))
-        .chain(
-            catalog
-                .audio_configs()
-                .map(|a| (a.track_id(), a.timescale())),
-        )
-        .collect();
-
-    // Per-track buffers, ordered by track_id
-    let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-    let mut track_durations: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut track_sample_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut track_samples: BTreeMap<u32, TrackSamples> = BTreeMap::new();
-    let has_video = !video_track_ids.is_empty();
-    let mut segment_number: u32 = 0;
-    let mut seen_first_keyframe = false;
-
+    let mut assembler = GopAssembler::new(catalog.clone());
     while let Some(frame) = fmp4.next_frame()? {
-        let is_video_keyframe = video_track_ids.contains(&frame.track_id) && frame.is_sync;
-
-        // A new segment opens at each video keyframe (after the first), or —
-        // for audio-only streams — at each 1-second wall-clock span.
-        let boundary = if has_video {
-            is_video_keyframe && seen_first_keyframe
-        } else {
-            audio_only_boundary(&track_durations, &track_timescales)
-        };
-
-        if boundary {
-            segment_number += 1;
-            if let Some(gop) = flush_track_bufs(
-                &mut track_bufs,
-                &mut track_durations,
-                &mut track_sample_counts,
-                &mut track_samples,
-                &track_timescales,
-                &video_track_ids,
-                &catalog,
-                segment_number,
-            )? {
-                on_gop(gop)?;
-            }
+        for gop in assembler.push(frame)? {
+            on_gop(gop)?;
         }
-
-        if is_video_keyframe {
-            seen_first_keyframe = true;
-        }
-
-        record_frame(
-            &frame,
-            &mut track_bufs,
-            &mut track_durations,
-            &mut track_sample_counts,
-            &mut track_samples,
-        );
     }
-
-    // Flush remaining data
-    segment_number += 1;
-    if let Some(gop) = flush_track_bufs(
-        &mut track_bufs,
-        &mut track_durations,
-        &mut track_sample_counts,
-        &mut track_samples,
-        &track_timescales,
-        &video_track_ids,
-        &catalog,
-        segment_number,
-    )? {
+    for gop in assembler.finish()? {
         on_gop(gop)?;
     }
 
     Ok(catalog)
 }
 
-/// Append a frame's bytes + metadata to the per-track buffers, recording
-/// the sample's offset within the buffer (post-append) for later use in
-/// the synthesized flat-MP4 `co64`. The recorded offset points at the
-/// sample payload — i.e. `prior_buffer_size + frame.moof_size + 8` (the
-/// moof preceded by 8 bytes of mdat header).
-pub(crate) fn record_frame(
-    frame: &crate::fragment::Frame,
-    track_bufs: &mut BTreeMap<u32, Vec<u8>>,
-    track_durations: &mut BTreeMap<u32, u64>,
-    track_sample_counts: &mut BTreeMap<u32, u32>,
-    track_samples: &mut BTreeMap<u32, TrackSamples>,
-) {
-    let buf = track_bufs.entry(frame.track_id).or_default();
-    let offset_in_track = buf.len() as u64 + frame.moof_size as u64 + 8;
-    buf.extend_from_slice(&frame.data);
-
-    *track_durations.entry(frame.track_id).or_default() += frame.duration as u64;
-    let count = track_sample_counts.entry(frame.track_id).or_default();
-    *count += 1;
-    let sample_index = *count;
-
-    let samples = track_samples.entry(frame.track_id).or_default();
-    samples.durations.push(frame.duration);
-    samples.sizes.push(frame.size);
-    samples.cts_offsets.push(frame.cts_offset);
-    samples.offsets_in_track.push(offset_in_track);
-    if frame.is_sync {
-        samples.sync_indices.push(sample_index);
-    }
+/// Assemble each video's own GOP before bundling it with timestamp-aligned
+/// audio. A sibling rendition's keyframe must not split an encoded GOP.
+pub(crate) struct GopAssembler {
+    catalog: Catalog,
+    video_track_ids: HashSet<u32>,
+    track_timescales: BTreeMap<u32, u32>,
+    pending: BTreeMap<u32, PendingTrack>,
+    segment_number: u32,
 }
 
-/// Flush all non-empty per-track buffers into a [`GopSegment`].
-///
-/// Returns `None` if all buffers are empty. Each non-empty track buffer
-/// is wrapped into a canonical segment by prepending its single-track
-/// [`mint_canonical_segment_prefix`] (uuid + DRISL catalog) — the
-/// emitted `tracks[tid]` bytes are the full canonical segment.
-/// Per-sample `offsets_in_track` shift by the uuid prefix length so
-/// they keep pointing at sample bytes within the emitted buffer.
-pub(crate) fn flush_track_bufs(
-    track_bufs: &mut BTreeMap<u32, Vec<u8>>,
-    track_durations: &mut BTreeMap<u32, u64>,
-    track_sample_counts: &mut BTreeMap<u32, u32>,
-    track_samples: &mut BTreeMap<u32, TrackSamples>,
-    track_timescales: &BTreeMap<u32, u32>,
-    video_track_ids: &HashSet<u32>,
-    catalog: &Catalog,
-    segment_number: u32,
-) -> Result<Option<GopSegment>> {
-    let mut tracks = BTreeMap::new();
-    let mut durations = BTreeMap::new();
-    let mut sample_counts = BTreeMap::new();
-    let mut samples = BTreeMap::new();
-    let mut first_decode_times = BTreeMap::new();
-    let mut body_size: u64 = 0;
-    for (&track_id, buf) in track_bufs.iter_mut() {
-        if !buf.is_empty() {
-            let prefix = mint_canonical_segment_prefix(catalog, track_id)?;
-            let prefix_len = prefix.len() as u64;
-            let mut combined = Vec::with_capacity(prefix.len() + buf.len());
-            combined.extend_from_slice(&prefix);
-            combined.append(buf);
-            // The track's GoP-start decode time is the first inner moof's tfdt.
-            first_decode_times.insert(track_id, crate::present::segment_index(&combined)?.2);
-            body_size += combined.len() as u64;
-            tracks.insert(track_id, combined);
-            durations.insert(track_id, track_durations.remove(&track_id).unwrap_or(0));
-            sample_counts.insert(track_id, track_sample_counts.remove(&track_id).unwrap_or(0));
-            let mut ts = track_samples.remove(&track_id).unwrap_or_default();
-            for off in &mut ts.offsets_in_track {
-                *off += prefix_len;
-            }
-            samples.insert(track_id, ts);
+#[derive(Default)]
+struct PendingTrack {
+    frames: VecDeque<crate::fragment::Frame>,
+    /// Index of this track's next keyframe, which belongs to its next GOP.
+    boundary: Option<usize>,
+    duration: u64,
+}
+
+impl GopAssembler {
+    pub(crate) fn new(catalog: Catalog) -> Self {
+        Self {
+            video_track_ids: catalog.video_configs().map(|v| v.track_id()).collect(),
+            track_timescales: catalog
+                .tracks()
+                .map(|track| (track.track_id, track.timescale))
+                .collect(),
+            catalog,
+            pending: BTreeMap::new(),
+            segment_number: 0,
         }
     }
-    // Clear any remaining entries for tracks that had no data
-    track_durations.clear();
-    track_sample_counts.clear();
-    track_samples.clear();
-    if tracks.is_empty() {
-        Ok(None)
-    } else {
-        let duration_us = compute_duration_us(&durations, track_timescales, video_track_ids);
-        Ok(Some(GopSegment {
-            number: segment_number,
+
+    pub(crate) fn push(&mut self, frame: crate::fragment::Frame) -> Result<Vec<GopSegment>> {
+        let mut output = Vec::new();
+        // Preserve the one-second bucket rule for audio-only streams.
+        if self.video_track_ids.is_empty() {
+            if let Some((&id, track)) = self.pending.iter().next() {
+                if audio_only_boundary(Some((id, track.duration)), &self.track_timescales) {
+                    output.push(
+                        self.emit(
+                            self.pending
+                                .iter()
+                                .map(|(&id, t)| (id, t.frames.len()))
+                                .collect(),
+                        )?,
+                    );
+                }
+            }
+        }
+        let track = self.pending.entry(frame.track_id).or_default();
+        if self.video_track_ids.contains(&frame.track_id)
+            && frame.is_sync
+            && !track.frames.is_empty()
+            && track.boundary.is_none()
+        {
+            track.boundary = Some(track.frames.len());
+        }
+        track.duration += u64::from(frame.duration);
+        track.frames.push_back(frame);
+        while !self.video_track_ids.is_empty()
+            && self
+                .video_track_ids
+                .iter()
+                .all(|id| self.pending.get(id).is_some_and(|t| t.boundary.is_some()))
+        {
+            let (cut, scale) = self.video_cut().unwrap();
+            // The last packet may cross the video boundary. Keep it whole;
+            // the next bucket starts with the next original audio packet.
+            if !self.catalog.audio_configs().all(|audio| {
+                self.pending
+                    .get(&audio.track_id())
+                    .and_then(|t| t.frames.back())
+                    .is_some_and(|f| {
+                        u128::from(f.decode_time + u64::from(f.duration)) * u128::from(scale)
+                            >= u128::from(cut) * u128::from(audio.timescale())
+                    })
+            }) {
+                break;
+            }
+            output.push(self.emit(self.counts(Some((cut, scale))))?);
+        }
+        Ok(output)
+    }
+
+    fn video_cut(&self) -> Option<(u64, u32)> {
+        self.pending.iter().find_map(|(&id, track)| {
+            if !self.video_track_ids.contains(&id) {
+                return None;
+            }
+            let frame = track.boundary.and_then(|n| track.frames.get(n));
+            let cut = frame.map(|f| f.decode_time).or_else(|| {
+                track
+                    .frames
+                    .back()
+                    .map(|f| f.decode_time + u64::from(f.duration))
+            })?;
+            Some((cut, self.track_timescales[&id]))
+        })
+    }
+
+    fn counts(&self, cut: Option<(u64, u32)>) -> BTreeMap<u32, usize> {
+        self.pending
+            .iter()
+            .map(|(&id, track)| {
+                let count = if self.video_track_ids.contains(&id) {
+                    track.boundary.unwrap_or(track.frames.len())
+                } else if let Some((cut, scale)) = cut {
+                    let audio_scale = self.track_timescales[&id];
+                    track
+                        .frames
+                        .iter()
+                        .take_while(|f| {
+                            u128::from(f.decode_time) * u128::from(scale)
+                                < u128::from(cut) * u128::from(audio_scale)
+                        })
+                        .count()
+                } else {
+                    track.frames.len()
+                };
+                (id, count)
+            })
+            .collect()
+    }
+
+    fn emit(&mut self, counts: BTreeMap<u32, usize>) -> Result<GopSegment> {
+        let mut tracks = BTreeMap::new();
+        let mut durations = BTreeMap::new();
+        let mut sample_counts = BTreeMap::new();
+        let mut samples = BTreeMap::new();
+        let mut first_decode_times = BTreeMap::new();
+        let mut body_size = 0;
+        for (id, count) in counts {
+            if count == 0 {
+                continue;
+            }
+            let track = self.pending.get_mut(&id).unwrap();
+            let prefix = mint_canonical_segment_prefix(&self.catalog, id)?;
+            let size = prefix.len()
+                + track
+                    .frames
+                    .iter()
+                    .take(count)
+                    .map(|f| f.data.len())
+                    .sum::<usize>();
+            let mut bytes = Vec::with_capacity(size);
+            bytes.extend_from_slice(&prefix);
+            first_decode_times.insert(id, track.frames[0].decode_time);
+            let mut metadata = TrackSamples {
+                durations: Vec::with_capacity(count),
+                sizes: Vec::with_capacity(count),
+                cts_offsets: Vec::with_capacity(count),
+                offsets_in_track: Vec::with_capacity(count),
+                sync_indices: Vec::new(),
+            };
+            let mut duration = 0;
+            for (index, frame) in track.frames.drain(..count).enumerate() {
+                duration += u64::from(frame.duration);
+                metadata.durations.push(frame.duration);
+                metadata.sizes.push(frame.size);
+                metadata.cts_offsets.push(frame.cts_offset);
+                metadata
+                    .offsets_in_track
+                    .push(bytes.len() as u64 + u64::from(frame.moof_size) + 8);
+                if frame.is_sync {
+                    metadata.sync_indices.push(index as u32 + 1);
+                }
+                bytes.extend_from_slice(&frame.data);
+            }
+            track.duration -= duration;
+            track.boundary = if self.video_track_ids.contains(&id) {
+                track
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find_map(|(i, f)| f.is_sync.then_some(i))
+            } else {
+                None
+            };
+            body_size += bytes.len() as u64;
+            tracks.insert(id, bytes);
+            durations.insert(id, duration);
+            sample_counts.insert(id, count as u32);
+            samples.insert(id, metadata);
+        }
+        self.segment_number += 1;
+        let duration_us =
+            compute_duration_us(&durations, &self.track_timescales, &self.video_track_ids);
+        Ok(GopSegment {
+            number: self.segment_number,
             tracks,
             durations,
             sample_counts,
@@ -305,7 +343,25 @@ pub(crate) fn flush_track_bufs(
             first_decode_times,
             body_size,
             duration_us,
-        }))
+        })
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<GopSegment>> {
+        let mut output = Vec::new();
+        while self.pending.values().any(|t| !t.frames.is_empty()) {
+            // Audio may finish after video. Keep that tail with the final
+            // video GOP instead of creating a trailing audio-only batch.
+            let cut =
+                if self.pending.iter().any(|(id, track)| {
+                    self.video_track_ids.contains(id) && track.boundary.is_some()
+                }) {
+                    self.video_cut()
+                } else {
+                    None
+                };
+            output.push(self.emit(self.counts(cut))?);
+        }
+        Ok(output)
     }
 }
 
@@ -341,20 +397,19 @@ pub(crate) fn compute_duration_us(
 /// Segment-boundary test for audio-only streams (no video reference track).
 ///
 /// Spec (`canonical-form.md § Segmentation Rule`): audio-only streams cut at
-/// 1-second wall-clock spans. `track_durations` holds each track's media
-/// ticks accumulated since the last flush; the reference clock is the
-/// smallest-id track present. Returns `true` once the reference track has
+/// 1-second wall-clock spans. The reference is the smallest-id buffered track
+/// and its accumulated duration in media ticks. Returns `true` once it has
 /// accumulated at least one second, meaning the *next* frame should open a
 /// new segment (mirroring how a video keyframe opens the next GoP). Returns
 /// `false` right after a flush (the map is empty) so a fresh segment never
 /// cuts on its very first frame.
 pub(crate) fn audio_only_boundary(
-    track_durations: &BTreeMap<u32, u64>,
+    reference: Option<(u32, u64)>,
     track_timescales: &BTreeMap<u32, u32>,
 ) -> bool {
-    match track_durations.iter().next() {
-        Some((tid, &ticks)) => {
-            let ts = track_timescales.get(tid).copied().unwrap_or(0);
+    match reference {
+        Some((tid, ticks)) => {
+            let ts = track_timescales.get(&tid).copied().unwrap_or(0);
             ts > 0 && ticks >= ts as u64
         }
         None => false,
@@ -418,6 +473,201 @@ mod tests {
         std::fs::read(&path)
             .or_else(|_| std::fs::read(format!("samples/{}", name)))
             .unwrap_or_else(|_| panic!("{} must exist for tests", path))
+    }
+
+    // Duplicate real encoded video samples into two renditions, preserving the
+    // payloads while varying decode-time offsets and same-timestamp arrival order.
+    fn multitrack_input(staggered: bool, reverse: bool) -> (Vec<u8>, BTreeMap<u32, Vec<u8>>, usize) {
+        use crate::fragment::{FrameInfo, TrackProgress, write_frame_fragment};
+        let fixture = read_fixture("h264-opus-frag.mp4");
+        let mut reader = FMP4Reader::new(Cursor::new(fixture)).unwrap();
+        let original = reader.catalog().clone();
+        let video = original.video_configs().next().unwrap();
+        let audio = original.audio_configs().next().unwrap();
+        let video_id = video.track_id();
+        let audio_id = audio.track_id();
+        let mut catalog = original.clone();
+        catalog.remap_track_ids(&BTreeMap::from([(video_id, 1), (audio_id, 3)]));
+        let mut second = video.clone();
+        second.container = second.container.with_track_id(2);
+        catalog
+            .video
+            .as_mut()
+            .unwrap()
+            .renditions
+            .insert("video2".into(), second);
+        let mut progress: BTreeMap<u32, TrackProgress> = BTreeMap::new();
+        let mut clocks = BTreeMap::<u32, u64>::new();
+        let mut fragments = Vec::new();
+        let mut gops = 0;
+        let mut last_audio = None;
+        while let Some(frame) = reader.next_frame().unwrap() {
+            let tids: &[u32] = if frame.track_id == video_id {
+                &[1, 2]
+            } else {
+                &[3]
+            };
+            if frame.track_id == video_id && frame.is_sync {
+                gops += 1;
+            }
+            if frame.track_id == audio_id {
+                last_audio = Some((
+                    FrameInfo {
+                        duration: frame.duration,
+                        size: frame.size,
+                        is_sync: frame.is_sync,
+                        cts_offset: frame.cts_offset,
+                    },
+                    frame.data[frame.moof_size as usize + 8..].to_vec(),
+                ));
+            }
+            for &tid in tids {
+                let offset = if tid != 3 && staggered {
+                    u64::from(frame.duration) / (3 - u64::from(tid))
+                } else {
+                    0
+                };
+                let clock = clocks.entry(tid).or_insert(offset);
+                let timescale = if tid == 3 {
+                    audio.timescale()
+                } else {
+                    video.timescale()
+                };
+                let info = FrameInfo {
+                    duration: frame.duration,
+                    size: frame.size,
+                    is_sync: frame.is_sync,
+                    cts_offset: frame.cts_offset,
+                };
+                let mut bytes = Vec::new();
+                write_frame_fragment(
+                    &mut bytes,
+                    tid,
+                    progress
+                        .entry(tid)
+                        .or_insert_with(|| TrackProgress::starting_at(offset)),
+                    &info,
+                    &frame.data[frame.moof_size as usize + 8..],
+                )
+                .unwrap();
+                fragments.push((*clock, timescale, tid, bytes));
+                *clock += frame.duration as u64;
+            }
+        }
+        // Real continuous audio can finish after the last video frame.
+        let (info, payload) = last_audio.unwrap();
+        for _ in 0..5 {
+            let clock = clocks.get_mut(&3).unwrap();
+            let mut bytes = Vec::new();
+            write_frame_fragment(
+                &mut bytes,
+                3,
+                progress.get_mut(&3).unwrap(),
+                &info,
+                &payload,
+            )
+            .unwrap();
+            fragments.push((*clock, audio.timescale(), 3, bytes));
+            *clock += u64::from(info.duration);
+        }
+        fragments.sort_by(|a, b| {
+            (a.0 as u128 * b.1 as u128)
+                .cmp(&(b.0 as u128 * a.1 as u128))
+                .then_with(|| {
+                    if reverse {
+                        b.2.cmp(&a.2)
+                    } else {
+                        a.2.cmp(&b.2)
+                    }
+                })
+        });
+        let mut input = build_init_segment(&catalog).unwrap();
+        let mut expected = BTreeMap::<u32, Vec<u8>>::new();
+        for (_, _, tid, bytes) in fragments {
+            input.extend_from_slice(&bytes);
+            expected.entry(tid).or_default().extend(bytes);
+        }
+        (input, expected, gops)
+    }
+
+    fn assert_complete_multitrack_gops(
+        gops: &[GopSegment],
+        expected: &BTreeMap<u32, Vec<u8>>,
+        count: usize,
+    ) {
+        assert_eq!(
+            gops.len(),
+            count,
+            "other renditions' keyframes must not create extra GOPs"
+        );
+        let mut actual = BTreeMap::<u32, Vec<u8>>::new();
+        for (index, gop) in gops.iter().enumerate() {
+            assert_eq!(gop.number, index as u32 + 1);
+            for tid in [1, 2] {
+                assert_eq!(
+                    gop.samples[&tid].sync_indices,
+                    [1],
+                    "each video GOP starts at exactly one keyframe"
+                );
+                assert_eq!(gop.sample_counts[&tid], gop.sample_counts[&1]);
+            }
+            for (&tid, bytes) in &gop.tracks {
+                let prefix_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+                actual
+                    .entry(tid)
+                    .or_default()
+                    .extend_from_slice(&bytes[prefix_len..]);
+            }
+        }
+        assert_eq!(
+            &actual, expected,
+            "preserve every encoded sample, tfdt, duration and fragment byte, including all audio"
+        );
+    }
+
+    #[test]
+    fn multitrack_gop_boundaries_preserve_complete_video_and_audio() {
+        for staggered in [false, true] {
+            for reverse in [false, true] {
+                let (input, expected, count) = multitrack_input(staggered, reverse);
+                let mut pulled = Vec::new();
+                segment_fmp4(&mut Cursor::new(&input), |gop| {
+                    pulled.push(gop);
+                    Ok(())
+                })
+                .unwrap();
+                assert_complete_multitrack_gops(&pulled, &expected, count);
+                for chunk in [137, 4096, input.len()] {
+                    let mut pushed = Vec::new();
+                    let mut segmenter = crate::Segmenter::new();
+                    for bytes in input.chunks(chunk) {
+                        for event in segmenter.feed(bytes).unwrap() {
+                            if let crate::SegmenterEvent::Segment(gop) = event {
+                                pushed.push(gop);
+                            }
+                        }
+                    }
+                    assert!(
+                        pushed.len() >= count - 1,
+                        "completed GOPs must be emitted before EOF"
+                    );
+                    for event in segmenter.flush().unwrap() {
+                        if let crate::SegmenterEvent::Segment(gop) = event {
+                            pushed.push(gop);
+                        }
+                    }
+                    assert_complete_multitrack_gops(&pushed, &expected, count);
+                    assert_eq!(
+                        pushed, pulled,
+                        "push chunking must not change canonical bytes"
+                    );
+                    assert!(
+                        segmenter.flush().unwrap().is_empty(),
+                        "EOF must not duplicate media"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -723,11 +973,11 @@ mod tests {
     #[test]
     fn audio_only_boundary_fires_at_one_second() {
         let ts: BTreeMap<u32, u32> = [(1u32, 48_000u32)].into_iter().collect();
-        assert!(!audio_only_boundary(&BTreeMap::new(), &ts), "empty (post-flush) → no cut");
+        assert!(!audio_only_boundary(None, &ts), "empty (post-flush) → no cut");
         let below: BTreeMap<u32, u64> = [(1u32, 47_040u64)].into_iter().collect();
-        assert!(!audio_only_boundary(&below, &ts), "<1s accumulated → no cut");
+        assert!(!audio_only_boundary(below.into_iter().next(), &ts), "<1s accumulated → no cut");
         let at: BTreeMap<u32, u64> = [(1u32, 48_000u64)].into_iter().collect();
-        assert!(audio_only_boundary(&at, &ts), ">=1s accumulated → cut");
+        assert!(audio_only_boundary(at.into_iter().next(), &ts), ">=1s accumulated → cut");
     }
 
     #[test]

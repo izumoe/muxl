@@ -258,6 +258,8 @@ pub struct Frame {
     pub track_id: u32,
     /// Whether this is a sync (key) frame.
     pub is_sync: bool,
+    /// Decode timestamp of this sample in its track timescale.
+    pub decode_time: u64,
     /// Duration of this sample in timescale ticks.
     pub duration: u32,
     /// Encoded sample size in bytes — the mdat payload length.
@@ -500,6 +502,7 @@ pub(crate) fn process_moof_mdat(
                 }
                 let sample_data = &mdat_data[offset..sample_end];
 
+                let decode_time = progress.decode_time;
                 let mut frag_buf = Vec::new();
                 write_frame_fragment(
                     &mut frag_buf,
@@ -516,6 +519,7 @@ pub(crate) fn process_moof_mdat(
 
                 on_frame(Frame {
                     track_id: out_tid,
+                    decode_time,
                     is_sync: frame.is_sync,
                     duration: frame.duration,
                     size: frame.size,
