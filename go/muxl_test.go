@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -692,5 +693,107 @@ func TestSignedMetafileFlatHeader(t *testing.T) {
 	}
 	if len(m) == 0 {
 		t.Fatal("Metafile produced no output for a signed segment")
+	}
+}
+
+// Remapping must happen before signing, in both static and live-manifest paths.
+func TestSignSegmentTrackRemap(t *testing.T) {
+	eng := newEngine(t)
+	input := readFile(t, fixtureFmp4)
+	baseline, err := collectEvents(func(events chan<- *muxl.Event) error {
+		return eng.SegmentEvents(context.Background(), bytes.NewReader(input), events)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original []*muxl.Event
+	for _, event := range baseline {
+		if event.Type == "segment" {
+			original = append(original, event)
+		}
+	}
+	payload := func(data []byte) []byte {
+		var result []byte
+		for len(data) > 0 {
+			if len(data) < 8 {
+				t.Fatal("truncated canonical box")
+			}
+			size := int(binary.BigEndian.Uint32(data[:4]))
+			if size < 8 || size > len(data) {
+				t.Fatal("invalid canonical box size")
+			}
+			if string(data[4:8]) == "mdat" {
+				result = append(result, data[8:size]...)
+			}
+			data = data[size:]
+		}
+		return result
+	}
+	for _, dynamic := range []bool{false, true} {
+		t.Run(fmt.Sprint("dynamic=", dynamic), func(t *testing.T) {
+			in := signerInput(t)
+			in.TrackRemap = map[uint32]uint32{1: 65537}
+			if dynamic {
+				in.TrackManifestFn = func() ([]byte, error) { return in.TrackManifest, nil }
+				in.WrapperManifestFn = func() ([]byte, error) { return in.WrapperManifest, nil }
+			}
+			events, err := collectEvents(func(events chan<- *muxl.Event) error {
+				return eng.SignSegment(context.Background(), bytes.NewReader(input), in, nil, nil, events)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var signed []byte
+			count := 0
+			for _, event := range events {
+				if event.Type == "init" {
+					for _, video := range event.Catalog.Video.Renditions {
+						if video.TrackID() != 65537 {
+							t.Fatalf("unmapped catalog video %d", video.TrackID())
+						}
+					}
+				}
+				if event.Type != "signed-segment" {
+					continue
+				}
+				if count >= len(original) {
+					t.Fatal("extra GOP after remapping")
+				}
+				for before, after := range map[string]string{"1": "65537", "2": "2"} {
+					if len(event.Tracks[after]) == 0 || event.Durations[after] != original[count].Durations[before] || event.SampleCounts[after] != original[count].SampleCounts[before] || event.FirstDecodeTimes[after] != original[count].FirstDecodeTimes[before] {
+						t.Fatalf("track %s changed media timing or samples", before)
+					}
+					if !bytes.Equal(payload(original[count].Tracks[before]), payload(event.Tracks[after])) {
+						t.Fatalf("track %s encoded samples changed", before)
+					}
+					signed = append(signed, event.Tracks[after]...)
+				}
+				count++
+			}
+			if count != len(original) {
+				t.Fatalf("GOP count: got %d want %d", count, len(original))
+			}
+			out, err := eng.Verify(context.Background(), bytes.NewReader(signed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc verifyDoc
+			if err := json.Unmarshal([]byte(out), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if len(doc.Segments) == 0 {
+				t.Fatal("no signed assets")
+			}
+			for _, segment := range doc.Segments {
+				if segment.ValidationState == "Invalid" {
+					t.Fatal("remapped asset signature invalid")
+				}
+			}
+			signed[len(signed)-1] ^= 1
+			out, err = eng.Verify(context.Background(), bytes.NewReader(signed))
+			if err == nil && !strings.Contains(out, "Invalid") {
+				t.Fatal("tampered mapped asset passed validation")
+			}
+		})
 	}
 }

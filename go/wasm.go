@@ -273,6 +273,9 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 		"--cert", "/keys/cert.pem",
 		"--alg", alg,
 	}
+	for _, id := range sortedU32Keys(in.TrackRemap) {
+		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", id, in.TrackRemap[id]))
+	}
 	if dynamicManifest {
 		args = append(args, "--host-manifest")
 	} else {

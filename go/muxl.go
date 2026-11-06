@@ -178,6 +178,8 @@ func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
 // manifest. When either Fn is set, the static field of the same name is used
 // only as a fallback if the other Fn is nil.
 type SignerInput struct {
+	// TrackRemap assigns IDs in the segmenter before hashing and signing.
+	TrackRemap        map[uint32]uint32
 	CertPEM           []byte
 	KeyPEM            []byte
 	Sign              func(data []byte) ([]byte, error)

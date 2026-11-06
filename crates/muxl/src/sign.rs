@@ -344,6 +344,25 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     segment_manifest: &str,
     wrapper_manifest: &str,
 ) -> Result<()> {
+    sign_segment_stream_remapped(
+        input,
+        output,
+        signer,
+        segment_manifest,
+        wrapper_manifest,
+        Default::default(),
+    )
+}
+
+/// Stream-sign with track IDs assigned before any canonical assets are signed.
+pub fn sign_segment_stream_remapped<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    segment_manifest: &str,
+    wrapper_manifest: &str,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> Result<()> {
     // Static path: pre-parse the manifest once and reuse the same base for every
     // GoP. Each per-segment clone still gets its own signing-time stamp.
     let segment_base: serde_json::Value = serde_json::from_str(segment_manifest)
@@ -351,7 +370,14 @@ pub fn sign_segment_stream<R: Read, W: Write>(
     let mut fetch_track = move || -> Result<serde_json::Value> { Ok(segment_base.clone()) };
     let wrapper = wrapper_manifest.to_owned();
     let mut fetch_wrapper = move || -> Result<String> { Ok(wrapper.clone()) };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(
+        input,
+        output,
+        signer,
+        &mut fetch_track,
+        &mut fetch_wrapper,
+        remap,
+    )
 }
 
 /// Stream-sign an fMP4 source like [`sign_segment_stream`], but fetch a fresh
@@ -366,20 +392,37 @@ pub fn sign_segment_stream_host<R: Read, W: Write>(
     output: &mut W,
     signer: &SignerKey,
 ) -> Result<()> {
+    sign_segment_stream_host_remapped(input, output, signer, Default::default())
+}
+
+/// Host-manifest streaming signing with IDs assigned before signing.
+pub fn sign_segment_stream_host_remapped<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    remap: std::collections::BTreeMap<u32, u32>,
+) -> Result<()> {
     let mut fetch_track = || -> Result<serde_json::Value> {
-        let json = host_get_manifest_callback(0).map_err(|e| {
-            Error::C2pa(c2pa::Error::BadParam(format!("host track manifest: {e}")))
-        })?;
+        let json = host_get_manifest_callback(0)
+            .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("host track manifest: {e}"))))?;
         serde_json::from_str(&json).map_err(|e| {
-            Error::C2pa(c2pa::Error::BadParam(format!("host track manifest JSON: {e}")))
+            Error::C2pa(c2pa::Error::BadParam(format!(
+                "host track manifest JSON: {e}"
+            )))
         })
     };
     let mut fetch_wrapper = || -> Result<String> {
-        host_get_manifest_callback(1).map_err(|e| {
-            Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}")))
-        })
+        host_get_manifest_callback(1)
+            .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("host wrapper manifest: {e}"))))
     };
-    sign_segment_stream_with(input, output, signer, &mut fetch_track, &mut fetch_wrapper)
+    sign_segment_stream_with(
+        input,
+        output,
+        signer,
+        &mut fetch_track,
+        &mut fetch_wrapper,
+        remap,
+    )
 }
 
 /// Shared streaming-sign loop. `next_track` and `next_wrapper` are invoked
@@ -391,10 +434,11 @@ fn sign_segment_stream_with<R: Read, W: Write>(
     signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     next_wrapper: &mut dyn FnMut() -> Result<String>,
+    remap: std::collections::BTreeMap<u32, u32>,
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
-    let mut segmenter = Segmenter::new();
+    let mut segmenter = Segmenter::with_remap(remap);
     let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
 

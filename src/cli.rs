@@ -47,7 +47,7 @@ pub struct CatalogArgs {
 }
 
 /// Parse a `OLD:NEW` track-id remap pair for `--remap-track`.
-fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
+pub fn parse_remap_pair(s: &str) -> std::result::Result<(u32, u32), String> {
     let (old, new) = s
         .split_once(':')
         .ok_or_else(|| format!("expected OLD:NEW, got {s:?}"))?;
