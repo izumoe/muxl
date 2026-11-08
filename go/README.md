@@ -42,6 +42,12 @@ All operations live behind the [`Engine`](muxl.go) interface, so the WASM
 backend can be swapped for a natively-linked Rust build later without touching
 callers.
 
+For signed audio metadata, set `SignerInput.TrackMeta` using output track IDs
+after any `TrackRemap`. Tracks with the same nonzero `AlternateGroup` are
+alternatives; `Label` is a display name. Source MP4 groups
+and labels are ignored unless `SourceTrackMeta` is enabled, since muxers assign
+them differently. Explicit `TrackMeta` overrides the source metadata.
+
 ### Memory
 
 Reuse an engine: it compiles the embedded module once, while each operation

@@ -13,8 +13,10 @@
 
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::collections::BTreeMap;
 
-use muxl_sign::{SignerKey, SigningAlg, sign_segment_stream};
+use muxl_sign::{SignerKey, SigningAlg, sign_segment_stream, sign_segment_stream_with_options, verify_segments};
+use muxl::catalog::{TrackMeta, TrackOptions};
 use serde_cbor::Value;
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -78,6 +80,48 @@ fn get_text_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
         }
     }
     None
+}
+
+#[test]
+fn signed_audio_metadata_survives_remapping_and_tampering_is_detected() {
+    let fmp4 = std::fs::read(repo_path("samples/fixtures/h264-opus-frag.mp4")).unwrap();
+    let signer = SignerKey::from_pem_files(
+        repo_path("samples/test-keys/es256k-cert.pem"),
+        repo_path("samples/test-keys/es256k-key.pem"),
+        SigningAlg::Es256K,
+    ).unwrap();
+    let options = TrackOptions {
+        remap: BTreeMap::from([(2, 9)]),
+        track_meta: BTreeMap::from([(9, TrackMeta { alternate_group: 3, label: "Music".into() })]),
+        ..Default::default()
+    };
+    let mut output = Vec::new();
+    sign_segment_stream_with_options(&mut Cursor::new(fmp4), &mut output, &signer, SEGMENT_MANIFEST, WRAPPER_MANIFEST, options).unwrap();
+    let events = cbor_stream(&output);
+    let mut found = false;
+    for event in events.iter().filter(|event| event_type(event) == Some("signed-segment")) {
+        let Some(Value::Map(tracks)) = get_text_key(event, "tracks") else { panic!("missing tracks") };
+        let Some(Value::Bytes(bytes)) = tracks.get(&Value::Text("9".into())) else { continue };
+        let catalog = muxl::catalog::from_segment(bytes).unwrap();
+        let audio = catalog.audio_configs().next().unwrap();
+        assert_eq!((audio.track_id(), audio.alternate_group, audio.label.as_deref()), (9, Some(3), Some("Music")));
+        let verified: serde_json::Value = serde_json::from_str(&verify_segments(bytes).unwrap()).unwrap();
+        let state = verified["segments"][0]["validation_state"].as_str().expect("missing validation state");
+        assert_ne!(state, "Invalid");
+        let mut tampered = bytes.clone();
+        let offset = tampered.windows(5).position(|window| window == b"Music").unwrap();
+        tampered[offset] = b'X';
+        match verify_segments(&tampered) {
+            Err(_) => {},
+            Ok(report) => {
+                let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+                assert_eq!(report["segments"][0]["validation_state"].as_str(), Some("Invalid"));
+            }
+        }
+        found = true;
+        break;
+    }
+    assert!(found, "signed audio track was not emitted");
 }
 
 #[test]

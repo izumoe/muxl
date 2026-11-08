@@ -276,6 +276,13 @@ func (e *WASMEngine) SignSegment(ctx context.Context, input io.Reader, in Signer
 	for _, id := range sortedU32Keys(in.TrackRemap) {
 		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", id, in.TrackRemap[id]))
 	}
+	for _, id := range sortedU32Keys(in.TrackMeta) {
+		meta := in.TrackMeta[id]
+		args = append(args, "--track-meta", fmt.Sprintf("%d:%d:%s", id, meta.AlternateGroup, meta.Label))
+	}
+	if in.SourceTrackMeta {
+		args = append(args, "--source-track-meta")
+	}
 	if dynamicManifest {
 		args = append(args, "--host-manifest")
 	} else {
@@ -420,6 +427,10 @@ func (e *WASMEngine) Canonicalize(ctx context.Context, mp4 []byte, opts ...Canon
 	for _, src := range sortedU32Keys(cfg.trackRemap) {
 		args = append(args, "--remap-track", fmt.Sprintf("%d:%d", src, cfg.trackRemap[src]))
 	}
+	for _, id := range sortedU32Keys(cfg.trackMeta) {
+		meta := cfg.trackMeta[id]
+		args = append(args, "--track-meta", fmt.Sprintf("%d:%d:%s", id, meta.AlternateGroup, meta.Label))
+	}
 	if err := e.runWith(ctx, args, fsCfg, false, nil, nil, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
@@ -439,7 +450,7 @@ func requireOneSigner(hasKey, hasSign bool) error {
 
 // sortedU32Keys returns m's keys in ascending order (nil map → nil slice), so
 // derived command-line args are deterministic.
-func sortedU32Keys(m map[uint32]uint32) []uint32 {
+func sortedU32Keys[V any](m map[uint32]V) []uint32 {
 	keys := make([]uint32, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

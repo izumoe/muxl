@@ -19,8 +19,8 @@ use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use muxl::cli as muxl_cli;
 
 use crate::{
-    Result, SignerKey, SigningAlg, cert, sign_segment_stream_host_remapped,
-    sign_segment_stream_remapped, sign_transcode_segment, verify_segments,
+    Result, SignerKey, SigningAlg, cert, sign_segment_stream_host_with_options,
+    sign_segment_stream_with_options, sign_transcode_segment, verify_segments,
 };
 
 #[derive(Parser)]
@@ -222,6 +222,12 @@ struct SignSegmentArgs {
     /// Assign track IDs before canonicalization and signing. Unlisted IDs stay unchanged.
     #[arg(long = "remap-track", value_name = "OLD:NEW", value_parser = muxl_cli::parse_remap_pair)]
     remap_track: Vec<(u32, u32)>,
+    /// Read audio groups and labels from the input MP4.
+    #[arg(long)]
+    source_track_meta: bool,
+    /// Assign audio metadata to an output track: ID:GROUP:LABEL.
+    #[arg(long = "track-meta", value_name = "ID:GROUP:LABEL", value_parser = muxl_cli::parse_track_meta)]
+    track_meta: Vec<(u32, muxl::catalog::TrackMeta)>,
     #[command(flatten)]
     signing: SigningArgs,
 }
@@ -359,16 +365,20 @@ pub fn cli_main() {
 }
 
 fn cmd_sign_segment(args: SignSegmentArgs) -> Result<()> {
-    let remap = args.remap_track.into_iter().collect();
+    let options = muxl::catalog::TrackOptions {
+        remap: args.remap_track.into_iter().collect(),
+        source_track_meta: args.source_track_meta,
+        track_meta: args.track_meta.into_iter().collect(),
+    };
     let (signer, manifests) = args.signing.into_signer_and_manifests()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     match manifests {
         ManifestSource::Static { track, wrapper } => {
-            sign_segment_stream_remapped(&mut stdin, &mut stdout, &signer, &track, &wrapper, remap)
+            sign_segment_stream_with_options(&mut stdin, &mut stdout, &signer, &track, &wrapper, options)
         }
         ManifestSource::Host => {
-            sign_segment_stream_host_remapped(&mut stdin, &mut stdout, &signer, remap)
+            sign_segment_stream_host_with_options(&mut stdin, &mut stdout, &signer, options)
         }
     }
 }

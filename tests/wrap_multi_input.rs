@@ -245,6 +245,7 @@ fn segment_flat_accepts_flat_input_and_roundtrips() {
         stdout: false,
         flat: Some(out.clone()),
         remap_track: vec![],
+        track_meta: vec![],
     })
     .unwrap();
 
@@ -276,6 +277,7 @@ fn segment_fmp4_interleaves_per_gop_not_per_track() {
         stdout: false,
         flat: None,
         remap_track: vec![],
+        track_meta: vec![],
     })
     .unwrap();
 
@@ -308,6 +310,7 @@ fn segment_fmp4_accepts_flat_input() {
         stdout: false,
         flat: None,
         remap_track: vec![],
+        track_meta: vec![],
     })
     .unwrap();
 
@@ -341,6 +344,7 @@ fn segment_fmp4_file_matches_streaming() {
         stdout: false,
         flat: None,
         remap_track: vec![],
+        track_meta: vec![],
     })
     .unwrap();
 

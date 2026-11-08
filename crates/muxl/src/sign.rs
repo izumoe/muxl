@@ -210,7 +210,17 @@ impl SignerKey {
         let alg = self.alg;
         let mut signer = CallbackSigner::new(
             move |_ctx, data: &[u8]| -> std::result::Result<Vec<u8>, c2pa::Error> {
-                host_sign_callback(data, alg).map_err(|e| c2pa::Error::BadParam(e.to_string()))
+                let signature = host_sign_callback(data, alg)
+                    .map_err(|e| c2pa::Error::BadParam(e.to_string()))?;
+                if matches!(alg, SigningAlg::Es256K) {
+                    // k256 verification requires low-S signatures, while an
+                    // external ECDSA signer may return either valid form.
+                    let signature = k256::ecdsa::Signature::from_slice(&signature)
+                        .map_err(|e| c2pa::Error::BadParam(e.to_string()))?;
+                    Ok(signature.normalize_s().unwrap_or(signature).to_bytes().to_vec())
+                } else {
+                    Ok(signature)
+                }
             },
             self.alg,
             self.cert_chain.clone(),
@@ -363,6 +373,19 @@ pub fn sign_segment_stream_remapped<R: Read, W: Write>(
     wrapper_manifest: &str,
     remap: std::collections::BTreeMap<u32, u32>,
 ) -> Result<()> {
+    sign_segment_stream_with_options(input, output, signer, segment_manifest, wrapper_manifest,
+        muxl::catalog::TrackOptions { remap, ..Default::default() })
+}
+
+/// Stream-sign after assigning track IDs and audio metadata.
+pub fn sign_segment_stream_with_options<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    segment_manifest: &str,
+    wrapper_manifest: &str,
+    options: muxl::catalog::TrackOptions,
+) -> Result<()> {
     // Static path: pre-parse the manifest once and reuse the same base for every
     // GoP. Each per-segment clone still gets its own signing-time stamp.
     let segment_base: serde_json::Value = serde_json::from_str(segment_manifest)
@@ -376,7 +399,7 @@ pub fn sign_segment_stream_remapped<R: Read, W: Write>(
         signer,
         &mut fetch_track,
         &mut fetch_wrapper,
-        remap,
+        options,
     )
 }
 
@@ -402,6 +425,17 @@ pub fn sign_segment_stream_host_remapped<R: Read, W: Write>(
     signer: &SignerKey,
     remap: std::collections::BTreeMap<u32, u32>,
 ) -> Result<()> {
+    sign_segment_stream_host_with_options(input, output, signer,
+        muxl::catalog::TrackOptions { remap, ..Default::default() })
+}
+
+/// Host-manifest signing with track IDs and audio metadata assigned first.
+pub fn sign_segment_stream_host_with_options<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    signer: &SignerKey,
+    options: muxl::catalog::TrackOptions,
+) -> Result<()> {
     let mut fetch_track = || -> Result<serde_json::Value> {
         let json = host_get_manifest_callback(0)
             .map_err(|e| Error::C2pa(c2pa::Error::BadParam(format!("host track manifest: {e}"))))?;
@@ -421,7 +455,7 @@ pub fn sign_segment_stream_host_remapped<R: Read, W: Write>(
         signer,
         &mut fetch_track,
         &mut fetch_wrapper,
-        remap,
+        options,
     )
 }
 
@@ -434,11 +468,11 @@ fn sign_segment_stream_with<R: Read, W: Write>(
     signer: &SignerKey,
     next_track: &mut dyn FnMut() -> Result<serde_json::Value>,
     next_wrapper: &mut dyn FnMut() -> Result<String>,
-    remap: std::collections::BTreeMap<u32, u32>,
+    options: muxl::catalog::TrackOptions,
 ) -> Result<()> {
     init_default_settings();
     let c2pa_signer = signer.build()?;
-    let mut segmenter = Segmenter::with_remap(remap);
+    let mut segmenter = Segmenter::with_options(options);
     let mut init_seen = false;
     let mut buf = [0u8; 64 * 1024];
 

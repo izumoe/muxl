@@ -232,6 +232,12 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **duration**: 0
 - **matrix, width/height, layer, alternate_group, volume**: from track config
 
+Audio catalogs may carry `alternateGroup` and `label`. A nonzero group is
+written to `tkhd.alternate_group`; a nonempty label is written as raw UTF-8 in
+`trak/udta/name`. When absent, the group remains zero and the name is omitted.
+Source MP4 metadata is used only when explicitly requested because muxers do
+not consistently assign the same meaning to these fields.
+
 #### mdhd
 
 - **version**: 0

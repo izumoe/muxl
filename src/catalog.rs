@@ -163,6 +163,26 @@ pub struct VideoConfig {
     pub jitter: Option<u64>,
 }
 
+fn alternate_group_unset(value: &Option<u32>) -> bool {
+    matches!(value, None | Some(0))
+}
+
+fn label_unset(value: &Option<String>) -> bool {
+    value.as_deref().unwrap_or_default().is_empty()
+}
+
+fn deserialize_alternate_group<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(|value| value.filter(|group| *group != 0))
+}
+
+fn deserialize_label<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|value| value.filter(|label| !label.is_empty()))
+}
+
 /// Per-rendition audio configuration. Mirrors Hang's `AudioConfig`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +197,53 @@ pub struct AudioConfig {
     pub bitrate: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub jitter: Option<u64>,
+    #[serde(
+        skip_serializing_if = "alternate_group_unset",
+        deserialize_with = "deserialize_alternate_group",
+        default
+    )]
+    pub alternate_group: Option<u32>,
+    #[serde(
+        skip_serializing_if = "label_unset",
+        deserialize_with = "deserialize_label",
+        default
+    )]
+    pub label: Option<String>,
+}
+
+/// Audio metadata keyed by output track ID, after any remapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMeta {
+    pub alternate_group: u32,
+    pub label: String,
+}
+
+/// Options for retaining or overriding audio metadata during segmentation.
+#[derive(Debug, Clone, Default)]
+pub struct TrackOptions {
+    pub remap: BTreeMap<u32, u32>,
+    pub source_track_meta: bool,
+    pub track_meta: BTreeMap<u32, TrackMeta>,
+}
+
+impl TrackOptions {
+    pub(crate) fn apply(&self, catalog: &mut Catalog) -> Result<()> {
+        if !self.remap.is_empty() {
+            catalog.remap_track_ids(&self.remap);
+        }
+        for (&id, meta) in &self.track_meta {
+            let audio = catalog
+                .audio_configs_mut()
+                .find(|audio| audio.track_id() == id)
+                .ok_or_else(|| Error::InvalidMp4(format!("track metadata requires an audio track: {id}")))?;
+            u16::try_from(meta.alternate_group).map_err(|_| {
+                Error::InvalidMp4(format!("alternate group out of tkhd range: {}", meta.alternate_group))
+            })?;
+            audio.alternate_group = (meta.alternate_group != 0).then_some(meta.alternate_group);
+            audio.label = (!meta.label.is_empty()).then(|| meta.label.clone());
+        }
+        Ok(())
+    }
 }
 
 /// Container / transport framing. MUXL only produces CMAF, but the
@@ -610,6 +677,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         c
@@ -667,6 +736,39 @@ mod tests {
         let json = to_hang_json(&original).unwrap();
         let decoded = from_hang_json(&json).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn audio_groups_and_labels_survive_catalog_round_trips() {
+        let json = r#"{
+            "audio": { "renditions": { "audio2": {
+                "codec": "opus", "container": { "kind": "cmaf", "timescale": 48000, "trackId": 2 },
+                "sampleRate": 48000, "numberOfChannels": 2,
+                "alternateGroup": 3, "label": "Music"
+            } } }
+        }"#;
+        let catalog = from_hang_json(json).unwrap();
+        let encoded = to_hang_json(&catalog).unwrap();
+        assert!(encoded.contains("\"alternateGroup\": 3"), "{encoded}");
+        assert!(encoded.contains("\"label\": \"Music\""), "{encoded}");
+
+        let drisl = to_drisl(&catalog).unwrap();
+        let decoded = from_drisl(&drisl).unwrap();
+        assert_eq!(to_hang_json(&decoded).unwrap(), encoded);
+        assert_eq!(decoded.filter_to_track(2), catalog);
+        let segment = crate::segment::mint_canonical_segment_prefix(&catalog, 2).unwrap();
+        assert_eq!(from_segment(&segment).unwrap(), catalog);
+    }
+
+    #[test]
+    fn empty_audio_metadata_keeps_legacy_catalog_bytes() {
+        let original = sample_catalog();
+        let mut json: serde_json::Value = serde_json::from_str(&to_hang_json(&original).unwrap()).unwrap();
+        let audio = &mut json["audio"]["renditions"]["audio1"];
+        audio["alternateGroup"] = serde_json::json!(0);
+        audio["label"] = serde_json::json!("");
+        let decoded = from_hang_json(&json.to_string()).unwrap();
+        assert_eq!(to_drisl(&decoded).unwrap(), to_drisl(&original).unwrap());
     }
 
     #[test]
@@ -742,6 +844,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         let drisl = to_drisl(&c).unwrap();
@@ -764,6 +868,8 @@ mod tests {
                 number_of_channels: 2,
                 bitrate: None,
                 jitter: None,
+                alternate_group: None,
+                label: None,
             },
         );
         let json = to_hang_json(&c).unwrap();

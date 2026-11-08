@@ -31,6 +31,14 @@ pub fn catalog_from_mp4<RS: Read + Seek>(mut input: RS) -> Result<Catalog> {
 
 /// Extract a Catalog from an already-parsed Moov box.
 pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
+    catalog_from_moov_with_source_track_meta(moov, false)
+}
+
+/// Source groups and labels are opt-in because muxers assign them differently.
+pub fn catalog_from_moov_with_source_track_meta(
+    moov: &Moov,
+    source_track_meta: bool,
+) -> Result<Catalog> {
     let mut catalog = Catalog::default();
 
     let mut traks: Vec<&Trak> = moov.trak.iter().collect();
@@ -47,7 +55,23 @@ pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
                 }
             }
             b"soun" => {
-                if let Some(config) = extract_audio_config(trak)? {
+                if let Some(mut config) = extract_audio_config(trak)? {
+                    if source_track_meta {
+                        config.alternate_group = (trak.tkhd.alternate_group != 0)
+                            .then_some(u32::from(trak.tkhd.alternate_group));
+                        if let Some(name) = trak
+                            .udta
+                            .as_ref()
+                            .and_then(|udta| udta.name.as_ref())
+                            .filter(|name| !name.value.is_empty())
+                        {
+                            config.label = Some(
+                                std::str::from_utf8(&name.value)
+                                    .map_err(|err| Error::InvalidMp4(format!("invalid UTF-8 track label: {err}")))?
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     catalog.insert_audio(format!("audio{}", track_id), config);
                 }
             }
@@ -334,6 +358,8 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
                     number_of_channels: opus.audio.channel_count as u32,
                     bitrate: None,
                     jitter: None,
+                    alternate_group: None,
+                    label: None,
                 }));
             }
             Codec::Mp4a(mp4a) => {
@@ -348,6 +374,8 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioConfig>> {
                     number_of_channels: mp4a.audio.channel_count as u32,
                     bitrate: None,
                     jitter: None,
+                    alternate_group: None,
+                    label: None,
                 }));
             }
             _ => continue,
@@ -528,7 +556,8 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
             track_id: config.track_id(),
             duration: 0,
             layer: 0,
-            alternate_group: 0,
+            alternate_group: u16::try_from(config.alternate_group.unwrap_or(0))
+                .map_err(|_| Error::InvalidMp4("alternate group out of tkhd range".into()))?,
             enabled: true,
             in_movie: true,
             in_preview: false,
@@ -565,7 +594,12 @@ pub(crate) fn build_audio_trak(config: &AudioConfig) -> Result<Trak> {
         },
         senc: None,
         tref: None,
-        udta: None,
+        udta: config.label.as_ref().filter(|label| !label.is_empty()).map(|label| {
+            mp4_atom::Udta {
+                name: Some(mp4_atom::TrackName { value: label.as_bytes().to_vec() }),
+                ..Default::default()
+            }
+        }),
     })
 }
 
@@ -649,6 +683,52 @@ mod tests {
 
         let h2 = Header::read_from(&mut cursor).unwrap();
         assert_eq!(h2.kind, Moov::KIND);
+    }
+
+    #[test]
+    fn audio_group_and_label_survive_init_synthesis() {
+        let data = read_fixture("h264-aac.mp4");
+        let mut catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
+        let audio = catalog.audio.as_mut().unwrap().renditions.values_mut().next().unwrap();
+        audio.alternate_group = Some(3);
+        audio.label = Some("Music: 音楽".to_owned());
+
+        let init = build_init_segment(&catalog).unwrap();
+        let moov = read_moov(&mut Cursor::new(&init)).unwrap();
+        let audio = moov.trak.iter().find(|track| track.mdia.hdlr.handler.as_ref() == b"soun").unwrap();
+        assert_eq!(audio.tkhd.alternate_group, 3);
+        assert!(init.windows("Music: 音楽".len()).any(|bytes| bytes == "Music: 音楽".as_bytes()));
+
+        let parsed = catalog_from_moov_with_source_track_meta(&moov, true).unwrap();
+        let audio = parsed.audio_configs().next().unwrap();
+        assert_eq!(audio.alternate_group, Some(3));
+        assert_eq!(audio.label.as_deref(), Some("Music: 音楽"));
+
+        let default = catalog_from_moov(&moov).unwrap();
+        let audio = default.audio_configs().next().unwrap();
+        assert_eq!(audio.alternate_group, None);
+        assert_eq!(audio.label, None);
+    }
+
+    #[test]
+    fn invalid_source_label_is_rejected_only_when_requested() {
+        let data = read_fixture("h264-aac.mp4");
+        let mut moov = read_moov(&mut Cursor::new(data)).unwrap();
+        let audio = moov.trak.iter_mut().find(|track| track.mdia.hdlr.handler.as_ref() == b"soun").unwrap();
+        audio.udta = Some(mp4_atom::Udta {
+            name: Some(mp4_atom::TrackName { value: vec![0xff] }),
+            ..Default::default()
+        });
+        assert!(catalog_from_moov(&moov).is_ok());
+        assert!(catalog_from_moov_with_source_track_meta(&moov, true).is_err());
+    }
+
+    #[test]
+    fn audio_group_outside_mp4_range_is_rejected() {
+        let data = read_fixture("h264-aac.mp4");
+        let mut catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
+        catalog.audio.as_mut().unwrap().renditions.values_mut().next().unwrap().alternate_group = Some(65536);
+        assert!(build_init_segment(&catalog).is_err());
     }
 
     #[test]

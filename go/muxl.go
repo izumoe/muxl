@@ -124,6 +124,7 @@ type CanonicalizeOption func(*canonicalizeConfig)
 
 type canonicalizeConfig struct {
 	trackRemap map[uint32]uint32
+	trackMeta  map[uint32]TrackMeta
 }
 
 // WithTrackRemap reassigns track IDs in the canonical output: each source
@@ -135,6 +136,11 @@ type canonicalizeConfig struct {
 // left as-is.
 func WithTrackRemap(remap map[uint32]uint32) CanonicalizeOption {
 	return func(c *canonicalizeConfig) { c.trackRemap = remap }
+}
+
+// WithTrackMetadata assigns audio groups and labels by output track ID.
+func WithTrackMetadata(meta map[uint32]TrackMeta) CanonicalizeOption {
+	return func(c *canonicalizeConfig) { c.trackMeta = meta }
 }
 
 // SegmentEventsOption configures [Engine.SegmentEvents].
@@ -151,6 +157,12 @@ type segmentEventsConfig struct {
 // canonicalize pass. Source ids absent from the map are left as-is.
 func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
 	return func(c *segmentEventsConfig) { c.trackRemap = remap }
+}
+
+// TrackMeta describes audio metadata by output track ID after remapping.
+type TrackMeta struct {
+	AlternateGroup uint32
+	Label          string
 }
 
 // SignerInput is the signing bundle for [Engine.SignSegment]. Exactly one of
@@ -179,7 +191,11 @@ func WithSegmentTrackRemap(remap map[uint32]uint32) SegmentEventsOption {
 // only as a fallback if the other Fn is nil.
 type SignerInput struct {
 	// TrackRemap assigns IDs in the segmenter before hashing and signing.
-	TrackRemap        map[uint32]uint32
+	TrackRemap map[uint32]uint32
+	// TrackMeta overrides audio metadata by output track ID, before signing.
+	TrackMeta map[uint32]TrackMeta
+	// SourceTrackMeta opts into reading source audio groups and labels.
+	SourceTrackMeta   bool
 	CertPEM           []byte
 	KeyPEM            []byte
 	Sign              func(data []byte) ([]byte, error)
@@ -340,6 +356,8 @@ type AudioConfig struct {
 	Container        Container `cbor:"container"`
 	SampleRate       uint32    `cbor:"sampleRate"`
 	NumberOfChannels uint32    `cbor:"numberOfChannels"`
+	AlternateGroup   uint32    `cbor:"alternateGroup,omitempty"`
+	Label            string    `cbor:"label,omitempty"`
 }
 
 // Container is the tagged-union container descriptor. Kind is "cmaf" (the
