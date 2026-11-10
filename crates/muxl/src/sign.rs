@@ -33,15 +33,14 @@ use muxl::{Segmenter, SegmenterEvent};
 use crate::cbor::SignedEvent;
 use crate::error::{Error, Result};
 
-/// Process-global c2pa-rs settings applied once before any sign call.
+/// Default c2pa-rs settings applied once per thread before any sign call.
 ///
 /// muxl doesn't yet have a use case for X.509 trust verification —
 /// our certs are issued via DID-based identity flows (Streamplace's
 /// ES256K + did:key path), not chained to public CAs. So we disable
 /// trust/OCSP/timestamp checks unconditionally. Callers that want
-/// stricter settings can call `c2pa::settings::Settings::from_toml`
-/// themselves before invoking any muxl API — Once::call_once
-/// ensures we won't stomp them.
+/// stricter settings can initialize muxl first, then configure c2pa on the
+/// same thread.
 const MUXL_SIGN_DEFAULTS_TOML: &str = r#"
 version_major = 1
 version_minor = 0
@@ -60,13 +59,20 @@ strict_v1_validation = false
 enabled = false
 "#;
 
-static SETTINGS_INIT: Once = Once::new();
+thread_local! {
+    static SETTINGS_INIT: Once = const { Once::new() };
+}
 
-pub(crate) fn init_default_settings() {
-    SETTINGS_INIT.call_once(|| {
+/// Initialize muxl's c2pa defaults for this thread.
+///
+/// Native callers that customize c2pa settings should call this before applying
+/// their overrides on each thread that uses muxl. Muxl initializes lazily when
+/// no explicit initialization is needed.
+pub fn init_default_settings() {
+    SETTINGS_INIT.with(|once| once.call_once(|| {
         c2pa::settings::Settings::from_toml(MUXL_SIGN_DEFAULTS_TOML)
             .expect("muxl default settings TOML should always parse");
-    });
+    }));
 }
 
 /// Cert chain + signing backend used to drive c2pa-rs.
@@ -866,6 +872,91 @@ fn sign_buf_as_transcode(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn settings_defaults_apply_per_thread_and_preserve_caller_overrides() {
+        for _ in 0..2 {
+            std::thread::spawn(|| {
+                init_default_settings();
+                let settings = c2pa::settings::Settings::to_toml().unwrap();
+                assert!(settings.contains("remote_manifest_fetch = false"), "{settings}");
+                assert!(settings.contains("verify_after_sign = false"), "{settings}");
+            }).join().unwrap();
+        }
+        std::thread::spawn(|| {
+            init_default_settings();
+            c2pa::settings::Settings::from_toml("[verify]\nverify_after_reading = false\nremote_manifest_fetch = true\nverify_after_sign = true\n").unwrap();
+            let settings = c2pa::settings::Settings::to_toml().unwrap();
+            init_default_settings();
+            assert_eq!(settings, c2pa::settings::Settings::to_toml().unwrap());
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn strict_verification_rejects_recorded_legacy_ingredient_failure() {
+        init_default_settings();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let key = SignerKey::from_pem_files(
+            root.join("samples/test-keys/es256k-cert.pem"),
+            root.join("samples/test-keys/es256k-key.pem"),
+            SigningAlg::Es256K,
+        )
+        .unwrap();
+        let signer = key.build().unwrap();
+        let fixture = std::fs::read(root.join("samples/fixtures/h264-opus-frag.mp4")).unwrap();
+        let mut segmenter = muxl::Segmenter::new();
+        let mut events = segmenter.feed(&fixture).unwrap();
+        events.extend(segmenter.flush().unwrap());
+        let output = events
+            .into_iter()
+            .find_map(|event| match event {
+                SegmenterEvent::Segment(gop) => gop.tracks.into_values().next(),
+                _ => None,
+            })
+            .expect("canonical fixture");
+        let source = sign_buf_as(&output, r#"{"claim_version":1,"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created"}]}}]}"#, &*signer, "m4s").unwrap();
+        for (code, accepted) in [
+            ("claimSignature.validated", true),
+            ("claimSignature.mismatch", false),
+        ] {
+            let mut builder = Builder::from_json(r#"{"claim_version":1,"assertions":[{"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.opened","parameters":{"org.cai.ingredientIds":["muxl.source"]}}]}}]}"#).unwrap();
+            let ingredient = builder
+                .add_ingredient_from_stream(
+                    r#"{"title":"source","relationship":"parentOf","label":"muxl.source"}"#,
+                    "m4s",
+                    &mut Cursor::new(&source),
+                )
+                .unwrap();
+            ingredient.add_validation_status(serde_json::from_value(json!({"code":code})).unwrap());
+            let mut signed = Vec::new();
+            builder
+                .sign(
+                    &*signer,
+                    "m4s",
+                    &mut Cursor::new(&output),
+                    &mut Cursor::new(&mut signed),
+                )
+                .unwrap();
+            let reader = c2pa::Reader::from_stream("m4s", Cursor::new(&signed)).unwrap();
+            let ingredient = &reader.active_manifest().unwrap().ingredients()[0];
+            assert!(
+                ingredient.validation_results().is_none(),
+                "fixture must use legacy status"
+            );
+            assert!(
+                ingredient
+                    .validation_status()
+                    .unwrap()
+                    .iter()
+                    .any(|status| status.code() == code)
+            );
+            assert_eq!(
+                crate::verify_segments_with_ingredients(&signed).is_ok(),
+                accepted,
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn rfc3339_known_values() {

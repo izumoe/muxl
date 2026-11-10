@@ -21,6 +21,7 @@ use muxl::cli as muxl_cli;
 use crate::{
     Result, SignerKey, SigningAlg, cert, sign_segment_stream_host_with_options,
     sign_segment_stream_with_options, sign_transcode_segment, verify_segments,
+    verify_segments_with_ingredients,
 };
 
 #[derive(Parser)]
@@ -56,6 +57,8 @@ enum Command {
     /// on stdout — the per-track equivalent of the manifest+cert blob the
     /// host used to get from the iroh-streamplace c2pa binding.
     Verify,
+    /// Verify segments and the signed source claims embedded in derivatives.
+    VerifyWithIngredients,
     /// Inspect a MUXL segment file: per-track codec info plus signing info
     /// (signer DID, validation state, actions, ingredients) when a C2PA/S2PA
     /// manifest is attached. Colorized when stdout is a TTY; --json emits the
@@ -342,7 +345,8 @@ pub fn cli_main() {
     let result = match cli.command {
         Command::SignSegment(args) => cmd_sign_segment(args),
         Command::SignTranscode(args) => cmd_sign_transcode(args),
-        Command::Verify => cmd_verify(),
+        Command::Verify => cmd_verify(false),
+        Command::VerifyWithIngredients => cmd_verify(true),
         Command::Inspect(args) => cmd_inspect(args),
         Command::GenKey(args) => cmd_gen_key(args),
         Command::GenCert(args) => cmd_gen_cert(args),
@@ -425,10 +429,14 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
     crate::inspect::inspect_file(&args.input, opts)
 }
 
-fn cmd_verify() -> Result<()> {
+fn cmd_verify(ingredients: bool) -> Result<()> {
     let mut buf = Vec::new();
     io::stdin().lock().read_to_end(&mut buf)?;
-    let json = verify_segments(&buf)?;
+    let json = if ingredients {
+        verify_segments_with_ingredients(&buf)?
+    } else {
+        verify_segments(&buf)?
+    };
     io::stdout().lock().write_all(json.as_bytes())?;
     Ok(())
 }

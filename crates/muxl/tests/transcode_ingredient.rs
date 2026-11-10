@@ -14,6 +14,7 @@ use c2pa::assertions::Actions;
 use c2pa::{Reader, Relationship, ValidationState};
 use muxl_sign::{
     SignerKey, SigningAlg, TRANSCODE_INGREDIENT_LABEL, sign_segment_stream, sign_transcode_segment,
+    verify_segments_with_ingredients,
 };
 use serde_cbor::Value;
 
@@ -21,6 +22,51 @@ fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel)
+}
+
+#[test]
+fn verification_exposes_verified_ingredient_signers() {
+    let source = signed_source_segments().remove(0);
+    let source_reader = Reader::from_stream("m4s", Cursor::new(&source)).expect("source reader");
+    let source_manifest = source_reader.active_manifest().expect("source manifest");
+    let source_label = source_manifest.label().expect("source label").to_owned();
+    let source_cert = source_manifest
+        .signature_info()
+        .expect("source signature")
+        .cert_chain()
+        .to_owned();
+    let manifest = format!(
+        r#"{{"assertions":[{{"label":"c2pa.actions","data":{{"actions":[{{"action":"c2pa.opened","parameters":{{"org.cai.ingredientIds":["{}"]}}}}]}}}}]}}"#,
+        TRANSCODE_INGREDIENT_LABEL
+    );
+    let signed = sign_transcode_segment(&unsigned_output_segment(), &source, &signer(), &manifest)
+        .expect("sign derivative");
+    let before = c2pa::settings::Settings::to_toml().expect("settings");
+    let result: serde_json::Value = serde_json::from_str(
+        &verify_segments_with_ingredients(&signed).expect("verify derivative"),
+    )
+    .expect("verification JSON");
+    assert_eq!(
+        before,
+        c2pa::settings::Settings::to_toml().expect("settings restored")
+    );
+    let segment = &result["segments"][0];
+    let ingredient = &segment["verified_ingredients"][&source_label];
+    assert_eq!(ingredient["cert"], source_cert);
+    assert_eq!(ingredient["manifest"]["label"], source_label);
+
+    let mut tampered = signed.clone();
+    let byte = tampered.len() - 1;
+    tampered[byte] ^= 1;
+    c2pa::settings::Settings::from_toml("[verify]\nverify_after_reading = false\n")
+        .expect("disable ordinary verification");
+    let unverified_settings = c2pa::settings::Settings::to_toml().expect("caller settings");
+    assert!(verify_segments_with_ingredients(&tampered).is_err(), "strict verification must reject tampered media");
+    assert_eq!(
+        unverified_settings,
+        c2pa::settings::Settings::to_toml().expect("settings restored")
+    );
+    c2pa::settings::Settings::from_toml(&before).expect("restore test settings");
 }
 
 fn signer() -> SignerKey {

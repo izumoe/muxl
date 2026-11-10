@@ -397,6 +397,29 @@ func TestSignTranscode(t *testing.T) {
 	if !hasAction(seg.Manifest, "c2pa.transcoded") {
 		t.Errorf("manifest missing a c2pa.transcoded action\n%s", out)
 	}
+
+	strict, err := eng.VerifyWithIngredients(context.Background(), bytes.NewReader(signed))
+	if err != nil {
+		t.Fatalf("verify source claims: %v", err)
+	}
+	var verified struct {
+		Segments []struct {
+			Ingredients map[string]struct {
+				Cert string `json:"cert"`
+			} `json:"verified_ingredients"`
+		} `json:"segments"`
+	}
+	if err := json.Unmarshal([]byte(strict), &verified); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified.Segments) != 1 || len(verified.Segments[0].Ingredients) != 1 {
+		t.Fatalf("expected one verified source claim: %s", strict)
+	}
+	for _, source := range verified.Segments[0].Ingredients {
+		if !strings.Contains(source.Cert, "BEGIN CERTIFICATE") {
+			t.Fatal("verified source claim has no signing certificate")
+		}
+	}
 }
 
 // TestSignSegmentDynamicManifest proves the per-segment manifest host

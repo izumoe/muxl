@@ -213,6 +213,15 @@ func (e *WASMEngine) Verify(ctx context.Context, input io.Reader) (string, error
 	return out.String(), nil
 }
 
+// VerifyWithIngredients also verifies and returns embedded source claims.
+func (e *WASMEngine) VerifyWithIngredients(ctx context.Context, input io.Reader) (string, error) {
+	var out bytes.Buffer
+	if err := e.runWith(ctx, []string{"muxl", "verify-with-ingredients"}, nil, true, input, &out, nil, nil, nil, nil, nil); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
 // Wrap implements [Engine].
 func (e *WASMEngine) Wrap(ctx context.Context, input io.Reader, format string, out io.Writer) error {
 	if format == "" {
