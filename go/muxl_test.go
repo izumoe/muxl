@@ -3,12 +3,17 @@ package muxl_test
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/asn1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/big"
 	"os"
 	"sort"
 	"strings"
@@ -795,5 +800,48 @@ func TestSignSegmentTrackRemap(t *testing.T) {
 				t.Fatal("tampered mapped asset passed validation")
 			}
 		})
+	}
+}
+
+// highSSigner returns a valid ECDSA signature in its noncanonical high-S form.
+type highSSigner struct{ *ecdsa.PrivateKey }
+
+func (signer highSSigner) Sign(random io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	der, err := signer.PrivateKey.Sign(random, digest, opts)
+	if err != nil {
+		return nil, err
+	}
+	var signature struct{ R, S *big.Int }
+	if _, err = asn1.Unmarshal(der, &signature); err != nil {
+		return nil, err
+	}
+	half := new(big.Int).Rsh(new(big.Int).Set(signer.Params().N), 1)
+	if signature.S.Cmp(half) <= 0 {
+		signature.S.Sub(signer.Params().N, signature.S)
+	}
+	return asn1.Marshal(signature)
+}
+
+func TestSignerAdapterCanonicalizesHighSWithoutChangingValidity(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := []byte("canonical C2PA callback signature")
+	signature, err := muxl.SignerToCallback(highSSigner{key}, 32)(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signature) != 64 {
+		t.Fatalf("signature length=%d", len(signature))
+	}
+	r, s := new(big.Int).SetBytes(signature[:32]), new(big.Int).SetBytes(signature[32:])
+	half := new(big.Int).Rsh(new(big.Int).Set(key.Params().N), 1)
+	if s.Cmp(half) > 0 {
+		t.Error("callback retained a high-S signature that ES256K verification rejects")
+	}
+	digest := sha256.Sum256(message)
+	if !ecdsa.Verify(&key.PublicKey, digest[:], r, s) {
+		t.Error("canonical signature no longer verifies")
 	}
 }
