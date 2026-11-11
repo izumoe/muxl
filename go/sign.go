@@ -2,6 +2,7 @@ package muxl
 
 import (
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/asn1"
@@ -24,6 +25,11 @@ import (
 // secp256k1 Ethereum key whose signer returns the 65-byte r‖s‖v recoverable
 // form rather than DER, use [RawSignerToCallback] instead.
 func SignerToCallback(signer crypto.Signer, byteLen int) func([]byte) ([]byte, error) {
+	var order, halfOrder *big.Int
+	if key, ok := signer.Public().(*ecdsa.PublicKey); ok {
+		order = key.Params().N
+		halfOrder = new(big.Int).Rsh(new(big.Int).Set(order), 1)
+	}
 	return func(data []byte) ([]byte, error) {
 		digest := sha256.Sum256(data)
 		sig, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256)
@@ -31,6 +37,14 @@ func SignerToCallback(signer crypto.Signer, byteLen int) func([]byte) ([]byte, e
 			return nil, fmt.Errorf("muxl host sign: %w", err)
 		}
 		if raw, ok := derECDSAToRaw(sig, byteLen); ok {
+			// ES256K verification requires canonical low-S signatures. Hardware
+			// and crypto.Signer implementations may return either valid form.
+			if order != nil {
+				s := new(big.Int).SetBytes(raw[byteLen:])
+				if s.Cmp(halfOrder) > 0 {
+					s.Sub(order, s).FillBytes(raw[byteLen:])
+				}
+			}
 			return raw, nil
 		}
 		return sig, nil
